@@ -4,12 +4,20 @@
 
 Despite its name, this project is more than a SocketCAN bridge. It is an **automotive network emulation and simulation bridge** — a scriptable, client-configured framework for interacting with, simulating, and testing automotive networks.
 
-## Supported Interfaces
+## Definitions
 
-- **SocketCAN** — CAN bus via the Linux SocketCAN subsystem
-- **DoIP** — Diagnostics over IP, supporting both client and server roles over Ethernet
+- **Signal** — a named, typed value carried within a PDU; has encoding, scaling, and optionally CRC or SecOC attributes
+- **PDU** — Protocol Data Unit; a structured payload mapped to one or more signals, carried within a frame
+- **Frame** — a raw bus-level message (CAN frame, Ethernet frame) that carries one or more PDUs
+- **Interface** — a physical or virtual network adapter managed by the bridge (CAN interface via SocketCAN, or Ethernet interface)
+- **Client** — a process that connects to the bridge over TCP to configure interfaces, define signals, and interact with the network at runtime
 
-A low-level TCP/UDP framework sits beneath these interfaces, through which a client connects, configures interface mappings, and defines signals and PDUs.
+## Goals
+
+- **Scriptability** — the primary goal; all behavior should be drivable via scripts
+- **Signal and PDU configuration** — define, map, and manipulate signals and PDUs at runtime
+- **CRC and SecOC support** — configure signal-level security and integrity features
+- **Client-driven configuration** — all network definitions, interface layouts, and authentication information are provided by the client over the TCP interface; nothing is hardcoded server-side
 
 ## Primary Use Cases
 
@@ -23,21 +31,20 @@ A low-level TCP/UDP framework sits beneath these interfaces, through which a cli
 - Forward diagnostic or runtime data between interfaces
 - Drive and observe signals in a scriptable manner
 
+## Supported Interfaces
+
+- **CAN** — CAN 2.0A (11-bit), CAN 2.0B (29-bit), and CAN-FD via the Linux SocketCAN subsystem; both physical hardware and virtual (vcan) interfaces are supported
+- **Ethernet** — standard Linux Ethernet interfaces; may connect to physical automotive networks via a media converter (e.g. 100BASE-T1 to standard Ethernet); the bridge has no knowledge of or responsibility for the physical media layer
+
 ## Architectural Parameters
 
-- **Target OS: Linux** — the bridge server requires Linux; SocketCAN and Ethernet-based interfaces (DoIP) both depend on Linux kernel interfaces and are not expected to be ported, though this could theoretically change in the future
+- **Target OS: Linux** — the bridge server requires Linux; SocketCAN and Ethernet-based interfaces both depend on Linux kernel interfaces and are not expected to be ported, though this could theoretically change in the future
 - **Client OS** — clients may run on any OS; however, any interface type that depends on Linux (SocketCAN, raw Ethernet) is out of scope for non-Linux clients initially
 - **Implementation language** — the bridge server is implemented in C; example clients will be provided in C and Python
 - **Concurrency model** — threaded; the server manages interfaces and sessions using threads
-- **Socket architecture** — a single persistent TCP socket acts as the main configuration server; additional TCP and UDP sockets are spawned dynamically based on the interfaces the client configures
+- **Socket architecture** — a single persistent TCP socket acts as the main configuration server; additional TCP and UDP sockets are spawned dynamically based on the interfaces the client configures; see Protocol Message Categories for the distinction between the configuration plane and the application plane
 - **Protocol framing** — the TCP configuration protocol uses a DoIP-inspired message framing scheme: a fixed header containing a message type field, which implies the expected payload length and parameter structure; all configuration and application-layer interactions use this format
-
-## Goals
-
-- **Scriptability** — the primary goal; all behavior should be drivable via scripts
-- **Signal and PDU configuration** — define, map, and manipulate signals and PDUs at runtime
-- **CRC and SecOC support** — configure signal-level security and integrity features
-- **Client-driven configuration** — all network definitions, interface layouts, and authentication information are provided by the client over the TCP interface; nothing is hardcoded server-side
+- **Persistent storage** — the bridge persists signal and network definitions to local files acting as non-volatile memory; configurations are modular so they are portable between devices; files include checksums that are validated on read; whether file-level encryption will be supported is deferred
 
 ## Client Session Model
 
@@ -100,7 +107,7 @@ All configuration messages flow over the primary TCP configuration socket. Runti
 
 ## Out-of-Scope Interfaces
 
-The bridge supports **CAN** (via SocketCAN) and **Ethernet** only. Ethernet may connect to a physical network that uses a media converter (e.g. 100BASE-T1 to standard Ethernet), but the bridge itself has no knowledge of or responsibility for the physical media layer beyond standard Ethernet. The following are explicitly out of scope:
+The bridge supports CAN and Ethernet only. The following are explicitly out of scope:
 
 - LIN
 - FlexRay
@@ -111,6 +118,4 @@ The bridge supports **CAN** (via SocketCAN) and **Ethernet** only. Ethernet may 
 
 - **No GUI** — initial scope covers the server and its TCP interface only; a frontend is explicitly out of scope at this stage
 - **No ECU flashing/programming as a first-class feature** — the bridge will not implement flashing logic itself; however, it will support full UDS sessions and can act as a transparent DoIP-to-CAN gateway, meaning an external diagnostic tool may perform flashing through the bridge
-- **Both virtual and physical CAN layers are in scope** — the bridge will support vcan (virtual) and real physical CAN hardware via SocketCAN
 - **No network definition file parsing** — the bridge does not parse any network definition formats (ARXML, DBC, CDD, ODX, etc.) directly; the client is responsible for extracting signal definitions, scaling functions, and any other necessary type information from whatever source it uses — whether a file format or manual definition — and providing that data to the bridge via the TCP interface
-- **Persistent network definitions** — once a client configures the bridge with signal and PDU definitions, the bridge stores this configuration so that subsequent runs do not require reconfiguration; this is a convenience feature, not a session-scoped cache
