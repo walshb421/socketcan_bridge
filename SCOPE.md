@@ -2,7 +2,7 @@
 
 ## Overview
 
-Despite its name, this project is more than a SocketCAN bridge. It is an **automotive network emulation and simulation bridge** — a scriptable, client-configured framework for interacting with, simulating, and testing automotive networks.
+This project is an **automotive network emulation and simulation bridge** — a scriptable, client-configured framework for interacting with, simulating, and testing automotive networks.
 
 ## Definitions
 
