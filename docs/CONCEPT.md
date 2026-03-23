@@ -39,7 +39,7 @@ A single persistent TCP connection per client, established at session start. All
 
 ### Application Plane
 
-Per-interface TCP or UDP sockets, created dynamically as part of interface configuration. Runtime signal drive, signal reads, frame injection, and diagnostic requests flow over these sockets. A client may have multiple application sockets active simultaneously — one per configured interface or functional group.
+Per-interface TCP sockets, created dynamically as part of interface configuration. (UDP application sockets are deferred to post-MVP.) Runtime signal drive, signal reads, frame injection, and diagnostic requests flow over these sockets. A client may have multiple application sockets active simultaneously — one per configured interface or functional group.
 
 ## Signal Model
 
@@ -72,15 +72,17 @@ Multiple clients may connect simultaneously. Each client has a session on the co
 
 Signal ownership is exclusive: only one client may drive a given signal at a time. A client acquires ownership when it configures or takes control of a signal. Ownership can be explicitly released or locked to prevent other clients from modifying it.
 
-Clients holding signal locks must maintain them via a keep-alive heartbeat. If the heartbeat lapses, locks are released automatically. On disconnect, all ownership held by a client is released.
+All clients must maintain a keep-alive heartbeat. If the heartbeat lapses, all ownership held by the session is released and the connection is closed. On disconnect, all ownership held by a client is released.
 
 Per-signal disconnect behavior is configurable: continue at last value, stop transmitting, or fall back to a designated default value.
 
 ## Persistence
 
-Signal and network definitions are written to local files after configuration. These act as non-volatile memory — the server can reload known configurations on restart. Configuration files include checksums validated on read and are designed to be portable between devices.
+Signal and network definitions are written to local files on explicit save command. These act as non-volatile memory — the server can reload known configurations on restart. Configuration files include checksums validated on read and are designed to be portable between devices.
 
 ## Diagnostics
+
+> **Post-MVP:** Diagnostics support is deferred. The following describes the intended post-MVP behavior.
 
 The bridge supports UDS transport over CAN (via ISO-TP) and over Ethernet (via DoIP). It does not interpret or construct UDS content — the client provides raw UDS payloads and the bridge handles framing, transport, and routing. The bridge can act as a DoIP client (issuing requests on behalf of a connected client) or as a DoIP server (receiving requests from external diagnostic tools and routing them to the appropriate target).
 

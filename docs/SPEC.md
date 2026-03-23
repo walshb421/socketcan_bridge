@@ -12,7 +12,7 @@ This document defines the low-level implementation requirements for the **ash** 
 
 - Single process, event-driven using `epoll` on Linux.
 - All I/O (TCP accept, client sockets, SocketCAN sockets) is non-blocking and managed through a single epoll loop.
-- No worker threads in MVP. All processing occurs on the main loop.
+- No worker threads in MVP. All processing occurs on the main loop. A threaded concurrency model is listed as the long-term architectural intent but is deferred post-MVP; the single-threaded epoll approach is sufficient for MVP and reduces implementation complexity.
 
 ### 2.2 Startup
 
@@ -23,7 +23,7 @@ This document defines the low-level implementation requirements for the **ash** 
 
 ### 2.3 Shutdown
 
-- On `SIGTERM` or `SIGINT`, gracefully close all client sessions (send a `SESSION_CLOSE` notification), release all interface attachments, and flush any pending persistence writes.
+- On `SIGTERM` or `SIGINT`, gracefully close all client sessions by sending `NOTIFY_SERVER_CLOSING` to each connected client, then release all interface attachments and flush any pending persistence writes before exiting.
 
 ---
 
@@ -59,7 +59,7 @@ All multi-byte integer fields are big-endian unless otherwise stated.
 
 Header size: **8 bytes**.
 
-Maximum payload length: **65535 bytes**.
+Maximum payload length (MVP): **65535 bytes**. The Payload Length field is 4 bytes for future extensibility; implementations MUST reject any message with Payload Length > 65535 and return `ERR_PAYLOAD_TOO_LARGE`.
 
 ### 3.3 Framing Rules
 
@@ -67,6 +67,7 @@ Maximum payload length: **65535 bytes**.
 - If `Protocol Version` does not match, the server sends `ERR_PROTOCOL_VERSION` and closes the connection.
 - If `Message Type` is unknown, the server sends `ERR_UNKNOWN_MESSAGE_TYPE` and continues.
 - If `Payload Length` exceeds the maximum, the server sends `ERR_PAYLOAD_TOO_LARGE` and closes the connection.
+- Any message containing a name field where `Name Len` exceeds 64 is rejected with `ERR_NAME_TOO_LONG`. The connection remains open.
 
 ### 3.4 Message Type Registry
 
@@ -77,7 +78,7 @@ Maximum payload length: **65535 bytes**.
 | `SESSION_INIT`         | `0x0001` | Initiate a session               |
 | `SESSION_KEEPALIVE`    | `0x0002` | Heartbeat                        |
 | `SESSION_CLOSE`        | `0x0003` | Graceful disconnect              |
-| `IFACE_LIST`           | `0x0010` | Request available CAN interfaces |
+| `IFACE_LIST`           | `0x0010` | Request available network interfaces |
 | `IFACE_ATTACH`         | `0x0011` | Attach to a CAN interface        |
 | `IFACE_DETACH`         | `0x0012` | Detach from a CAN interface      |
 | `IFACE_VCAN_CREATE`    | `0x0013` | Create a virtual CAN interface   |
@@ -108,7 +109,12 @@ Maximum payload length: **65535 bytes**.
 | `CFG_ACK`              | `0x8040` | Persistence operation complete          |
 | `NOTIFY_OWN_REVOKED`   | `0x9001` | Ownership was revoked (unsolicited)     |
 | `NOTIFY_IFACE_DOWN`    | `0x9002` | Interface went down (unsolicited)       |
+| `NOTIFY_SERVER_CLOSING`| `0x9003` | Server is shutting down (unsolicited)   |
 | `ERR`                  | `0xFFFF` | Error response                          |
+
+**Notes:**
+- Value `0x8002` is reserved. `SESSION_KEEPALIVE` has no acknowledgement.
+- `IFACE_VCAN_ACK` (`0x8013`) is used to acknowledge both `IFACE_VCAN_CREATE` and `IFACE_VCAN_DESTROY`.
 
 ### 3.5 Error Payload
 
@@ -127,15 +133,18 @@ All `ERR` messages share this payload structure:
 | `0x0003`   | `ERR_PAYLOAD_TOO_LARGE`    | Payload exceeds maximum length           |
 | `0x0004`   | `ERR_NOT_IN_SESSION`       | Operation requires an active session     |
 | `0x0005`   | `ERR_ALREADY_IN_SESSION`   | SESSION_INIT sent on active session      |
+| `0x0006`   | `ERR_NAME_TOO_LONG`        | Name field exceeds maximum length of 64 bytes |
 | `0x0010`   | `ERR_IFACE_NOT_FOUND`      | Named interface does not exist           |
 | `0x0011`   | `ERR_IFACE_ALREADY_ATTACHED` | Interface already attached to a session |
 | `0x0012`   | `ERR_IFACE_ATTACH_FAILED`  | SocketCAN bind failed                    |
 | `0x0020`   | `ERR_DEF_INVALID`          | Malformed definition payload             |
-| `0x0021`   | `ERR_DEF_CONFLICT`         | Name already defined with different type |
+| `0x0021`   | `ERR_DEF_CONFLICT`         | Name already in use by a definition of a different type |
+| `0x0022`   | `ERR_DEF_IN_USE`           | Definition cannot be deleted; referenced by another definition |
 | `0x0030`   | `ERR_OWN_NOT_AVAILABLE`    | Signal owned or locked by another client |
 | `0x0031`   | `ERR_OWN_NOT_HELD`         | Client does not hold ownership           |
 | `0x0040`   | `ERR_CFG_IO`               | File I/O error during persistence        |
 | `0x0041`   | `ERR_CFG_CHECKSUM`         | Checksum mismatch on load                |
+| `0x0042`   | `ERR_CFG_CONFLICT`         | Loaded file contains definitions conflicting with in-memory state |
 
 ---
 
@@ -147,6 +156,8 @@ All `ERR` messages share this payload structure:
 2. Client sends `SESSION_INIT`.
 3. Server assigns a session ID (u32, server-generated, non-zero), creates session state, and responds with `SESSION_INIT_ACK`.
 4. All subsequent messages on the connection are processed in the context of that session.
+
+> **Sequential protocol:** The configuration plane is strictly request/response. The client MUST wait for an ACK or ERR response before sending the next request. Pipelining is not supported in the MVP.
 
 **`SESSION_INIT` payload:**
 
@@ -187,6 +198,9 @@ All `ERR` messages share this payload structure:
 - The port is communicated to the client in `IFACE_ATTACH_ACK`.
 - The client connects to this port to begin runtime interaction on that interface.
 - Multiple clients may connect to the same application socket if they hold ownership of different signals on that interface.
+- Connecting to an application plane socket implicitly subscribes the client to all inbound signal updates (`SIG_RX`) and raw frames (`FRAME_RX`) received on that interface. There is no explicit subscribe/unsubscribe message in the MVP.
+- The application plane socket listener is created when the interface is attached and destroyed when the interface is detached or the owning session closes. All connected clients are disconnected when the socket is destroyed.
+- Interface attachment is exclusive: only one session may attach a given interface at a time. Multiple clients may connect to the resulting application plane socket.
 
 ### 5.2 Frame Format
 
@@ -219,6 +233,16 @@ Maximum application payload: **4096 bytes**.
 | `FRAME_RX`      | `0x8010` | Inbound raw CAN frame           |
 | `APP_ERR`       | `0xFFFF` | Error (2-byte code + message)   |
 
+**Application Plane Error Codes (`APP_ERR`):**
+
+| Code   | Name                  | Description                                              |
+|--------|-----------------------|----------------------------------------------------------|
+| `0x0001` | `ERR_SIG_NOT_FOUND` | Named signal does not exist                             |
+| `0x0002` | `ERR_SIG_NOT_OWNED` | Client does not hold ownership of the signal            |
+| `0x0003` | `ERR_SIG_NOT_MAPPED`| Signal exists but is not contained in any frame         |
+| `0x0004` | `ERR_FRAME_NOT_FOUND`| CAN ID does not match any known frame definition       |
+| `0x0005` | `ERR_DLC_INVALID`   | DLC value is invalid for the active CAN mode            |
+
 ### 5.4 Signal Write Payload (`SIG_WRITE`)
 
 ```
@@ -228,7 +252,8 @@ Maximum application payload: **4096 bytes**.
 ```
 
 - The client must hold ownership of the named signal.
-- The server encodes the value into the signal's bit position within the PDU/frame and queues the frame for transmission.
+- The server encodes the value into the signal's bit position within the PDU/frame and routes the frame to the interface corresponding to the application plane socket on which the `SIG_WRITE` was received.
+- If the signal is not contained in any frame definition, the server returns `APP_ERR` with `ERR_SIG_NOT_MAPPED`.
 
 ### 5.5 Signal Read Payload (`SIG_READ` / `SIG_READ_RESP`)
 
@@ -246,16 +271,31 @@ Response:
 +-------------------+------------------+------------------+
 ```
 
+- Reads do not require ownership. Any client connected to the application plane socket may read any signal associated with that interface.
+
 ### 5.6 Raw Frame Transmit/Receive (`FRAME_TX` / `FRAME_RX`)
 
 ```
-+------------------+-------------------+------------------+
-| CAN ID (4B)      | DLC (1B)          | Data (0–8 bytes) |
-+------------------+-------------------+------------------+
++------------------+-------------------+------------------+------------------+
+| CAN ID (4B)      | DLC (1B)          | Flags (1B)       | Data (0–64 bytes)|
++------------------+-------------------+------------------+------------------+
 ```
 
 - CAN ID bit 31 set indicates extended (29-bit) ID.
-- DLC must be ≤ 8 for CAN 2.0 frames.
+- `Flags` bit 0: set to `1` for CAN FD frames. Bit 1: set to `1` to enable Bit Rate Switch (BRS). All other bits reserved, must be zero.
+- For CAN 2.0 frames (`Flags` bit 0 = 0): DLC MUST be 0–8. Data length equals DLC.
+- For CAN FD frames (`Flags` bit 0 = 1): DLC follows the CAN FD encoding:
+
+| DLC | Data Length (bytes) |
+|-----|---------------------|
+| 0–8 | 0–8 (same as CAN 2.0) |
+| 9   | 12                  |
+| 10  | 16                  |
+| 11  | 20                  |
+| 12  | 24                  |
+| 13  | 32                  |
+| 14  | 48                  |
+| 15  | 64                  |
 
 ---
 
@@ -290,6 +330,10 @@ Response:
 
 Physical value = (raw × scale) + offset, clamped to [min, max].
 
+Signal names are case-sensitive. Maximum name length: **64 bytes**. Names exceeding this are rejected with `ERR_NAME_TOO_LONG`.
+
+The on_disconnect default value (`0x03`) reverts the signal to the physical value corresponding to raw = 0, which equals the signal's configured offset.
+
 ### 6.2 PDU Definition (`DEF_PDU` payload)
 
 ```
@@ -310,6 +354,7 @@ Followed by `Signal Count` signal mapping entries:
 
 - `Start Bit` is the LSB position of the signal within the PDU, numbered from bit 0 at the LSB of byte 0.
 - All referenced signal names must already be defined.
+- `Signal Count` MUST NOT exceed **32**. The server rejects PDU definitions exceeding this limit with `ERR_DEF_INVALID`.
 
 ### 6.3 Frame Definition (`DEF_FRAME` payload)
 
@@ -338,6 +383,8 @@ Followed by `PDU Count` PDU mapping entries:
 
 - `TX Period`: cyclic transmission interval in milliseconds. `0` means event-driven (transmit on signal write).
 - All referenced PDU names must already be defined.
+- `PDU Count` MUST NOT exceed **8**. The server rejects frame definitions exceeding this limit with `ERR_DEF_INVALID`.
+- For CAN FD frames, `DLC` may be 0–15 per the CAN FD DLC encoding table in §5.6.
 
 ### 6.4 Definition Deletion (`DEF_DELETE` payload)
 
@@ -349,7 +396,7 @@ Followed by `PDU Count` PDU mapping entries:
 
 Def Type: `0x01` = signal, `0x02` = PDU, `0x03` = frame.
 
-Deletion fails with `ERR_DEF_CONFLICT` if another definition depends on the target.
+Deletion fails with `ERR_DEF_IN_USE` if another definition depends on the target (e.g., deleting a signal that is mapped in a PDU, or a PDU that is mapped in a frame).
 
 ---
 
@@ -406,9 +453,9 @@ Followed by `RX Filter Count` filter entries (may be 0 for promiscuous):
 **`IFACE_ATTACH_ACK` payload:**
 
 ```
-+------------------+------------------+
-| App Port (2B)    | Interface Index (4B) |
-+------------------+------------------+
++------------------+
+| App Port (2B)    |
++------------------+
 ```
 
 `App Port` is the TCP port the client should connect to for the application plane socket for this interface.
@@ -454,8 +501,10 @@ The server executes `ip link add/del` via the kernel `NETLINK_ROUTE` socket (not
 | `0x02` | Continue at last value                  |
 | `0x03` | Revert to default value (0 / offset)    |
 
+- Ownership is NOT implicitly granted when a signal is defined via `DEF_SIGNAL`. The client must explicitly call `OWN_ACQUIRE` before it may write to the signal.
 - If the signal is already owned by another client and not locked, ownership is transferred and `NOTIFY_OWN_REVOKED` is sent to the previous owner.
 - If locked, the server responds with `ERR_OWN_NOT_AVAILABLE`.
+- For cyclic frames (`tx_period_ms > 0`): cyclic transmission begins when the first `SIG_WRITE` is received for any signal in the frame. If all signals in a cyclic frame are released with `on_disconnect = stop`, the cyclic timerfd is disarmed. If any signal uses `on_disconnect = last` or `on_disconnect = default`, the cyclic timer continues firing after that client disconnects.
 
 ### 8.2 Release (`OWN_RELEASE` payload)
 
@@ -476,6 +525,12 @@ Same payload as `OWN_RELEASE`. Locking requires the caller to currently hold own
 | Name Len (1B)    | Name (N bytes)   |
 +------------------+------------------+
 ```
+
+### 8.5 Definition Namespace
+
+Signal, PDU, and frame definitions reside in a single global namespace shared across all sessions. Definitions persist across client disconnects — a session disconnect does NOT delete the definitions that session created.
+
+Re-defining a name with the same type is allowed and overwrites the existing definition, provided no other definition currently depends on it (e.g., a signal mapped in a PDU cannot be redefined while that PDU exists). Re-defining a name with a different type (e.g., reusing a signal name for a PDU) is rejected with `ERR_DEF_CONFLICT`.
 
 ---
 
@@ -521,11 +576,14 @@ Entry Payload: the same binary payload format as the corresponding `DEF_*` confi
 +------------------+------------------+
 ```
 
-Saves all definitions currently held in the server to a file `<name>.ashcfg` in the storage directory. Overwrites if it exists. `CFG_ACK` has no payload on success.
+Saves all definitions currently held in the server's global definition store to a file `<name>.ashcfg` in the storage directory. This is a global save — all signals, PDUs, and frames from all sessions are included. Overwrites if the file exists. `CFG_ACK` has no payload on success.
 
 ### 9.4 Load (`CFG_LOAD` payload)
 
-Same structure as `CFG_SAVE`. Loads and applies all definitions from `<name>.ashcfg`. On checksum failure, responds with `ERR_CFG_CHECKSUM` and applies nothing. `CFG_ACK` has no payload on success.
+Same structure as `CFG_SAVE`. Loads and applies all definitions from `<name>.ashcfg`. The load is atomic:
+- On checksum failure, responds with `ERR_CFG_CHECKSUM` and applies nothing.
+- If any definition in the file conflicts with an existing in-memory definition (same name, different type), the server aborts the load, responds with `ERR_CFG_CONFLICT`, and applies nothing.
+- On success, all definitions from the file are merged into the global store. `CFG_ACK` has no payload.
 
 ### 9.5 Auto-load on Startup
 
@@ -541,11 +599,10 @@ On startup, the server loads all `.ashcfg` files found in the storage directory 
 typedef struct ash_session {
     uint32_t        id;
     int             config_fd;
-    int             app_fd;           /* -1 if not yet connected */
     char            client_name[64];
     time_t          last_rx;
     ash_signal_ref  *owned_signals;   /* linked list */
-    ash_iface_ref   *attached_ifaces; /* linked list */
+    ash_iface_ref   *attached_ifaces; /* linked list of ash_iface_t owned by this session */
 } ash_session_t;
 ```
 
@@ -615,6 +672,13 @@ typedef struct ash_iface {
     uint8_t     mode;
     uint32_t    bitrate;
 } ash_iface_t;
+
+typedef struct ash_cyclic_frame {
+    ash_frame_def_t     *frame;
+    ash_iface_t         *iface;
+    int                  timerfd;
+    uint8_t              data[64];  /* current frame data buffer */
+} ash_cyclic_frame_t;
 ```
 
 ---
@@ -625,7 +689,7 @@ typedef struct ash_iface {
 
 1. Look up the signal by name in the definition store.
 2. Compute raw value: `raw = (physical - offset) / scale`, clamped to the signal's representable range.
-3. Look up which PDU contains this signal and the signal's `start_bit` and `bit_length`.
+3. Look up which PDU contains this signal and the signal's `start_bit` and `bit_length`. If the signal is not mapped to any PDU, return `APP_ERR` with `ERR_SIG_NOT_MAPPED`.
 4. Look up which frame contains that PDU and the PDU's `byte_offset`.
 5. Pack `raw` into the frame's data bytes at the correct bit position, respecting `byte_order`.
 6. If the frame is event-driven (`tx_period_ms == 0`), enqueue the frame for immediate transmission on the interface's SocketCAN socket.
@@ -642,9 +706,11 @@ typedef struct ash_iface {
 
 ### 11.3 Cyclic Transmission
 
-- A timerfd is created per cyclic frame at the frame's `tx_period_ms` interval.
-- On timer expiry, the server transmits the frame's current data buffer on the associated interface.
+- A timerfd is created per cyclic frame the first time a `SIG_WRITE` is received for any signal in that frame.
+- On timer expiry, the server transmits the frame's current data buffer on the interface corresponding to the application socket that delivered the first write.
 - Timerfd events are handled in the main epoll loop.
+- When all owning sessions of signals in a cyclic frame disconnect or release ownership with `on_disconnect = stop`, the timerfd is disarmed and the `ash_cyclic_frame_t` entry is removed.
+- If any signal in the frame has `on_disconnect = last` or `on_disconnect = default`, the timerfd continues running after those sessions disconnect, using the last-written or default-computed data buffer.
 
 ---
 
@@ -679,7 +745,7 @@ int ash_unlock(ash_ctx_t *ctx, const char *signal);
 
 /* Runtime */
 int    ash_write(ash_ctx_t *ctx, const char *signal, double value);
-double ash_read(ash_ctx_t *ctx, const char *signal);
+int    ash_read(ash_ctx_t *ctx, const char *signal, double *value_out);
 int    ash_frame_tx(ash_ctx_t *ctx, const char *iface, uint32_t can_id, uint8_t dlc, const uint8_t *data);
 int    ash_poll(ash_ctx_t *ctx, ash_event_t *event, int timeout_ms);
 
