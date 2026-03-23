@@ -1,5 +1,7 @@
 # Prerequisites
 *.d
+bin/
+build/
 
 # Object files
 *.o
@@ -53,3 +55,7 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Vim workspace.session
+*.vim
+*.swp
