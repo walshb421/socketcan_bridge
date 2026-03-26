@@ -6,7 +6,6 @@
 
 #define MAX_SESSIONS          1024
 #define DEFAULT_PORT          4000
-#define NOTIFY_SERVER_CLOSING "SERVER_CLOSING\r\n"
 
 typedef struct {
     int fd;
