@@ -11,7 +11,8 @@ add_compile_options($<$<CONFIG:Debug>:-Wall>
 include_directories(include)
 
 # Server
-add_executable(ash-server server/main.c)
+add_executable(ash-server server/main.c server/server.c)
+target_compile_definitions(ash-server PRIVATE _GNU_SOURCE)
 
 # Client library
 add_library(libash_shared SHARED lib/ash.c)
