@@ -20,6 +20,7 @@ typedef struct {
     int         epoll_fd;
     int         listen_fd;
     int         signal_fd;
+    int         netlink_fd;   /* RTMGRP_LINK monitoring socket (-1 if unused) */
     const char *storage_dir;
     uint16_t    port;
     session_t   sessions[MAX_SESSIONS];

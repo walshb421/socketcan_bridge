@@ -1,5 +1,6 @@
 #include "session.h"
 #include "proto.h"
+#include "iface.h"
 
 #include "ash/proto.h"
 
@@ -69,8 +70,8 @@ void session_arm_timer(session_t *sess)
 
 void session_cleanup(server_t *s, session_t *sess)
 {
-    (void)s;
-    /* Future: release owned signals, detach interfaces */
+    if (sess->session_id != 0)
+        iface_session_cleanup(s, sess->session_id);
     sess->session_id = 0;
     memset(sess->client_name, 0, sizeof(sess->client_name));
 }
