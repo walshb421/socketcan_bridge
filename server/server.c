@@ -1,4 +1,5 @@
 #include "server.h"
+#include "proto.h"
 
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
@@ -199,6 +200,43 @@ void server_run(server_t *s)
                     server_del_fd(s, fd);
                     session_remove(s, fd);
                     close(fd);
+                    continue;
+                }
+
+                /* Client fd: data available — read and dispatch one frame */
+                if (events[i].events & EPOLLIN) {
+                    proto_frame_t frame;
+                    int close_session = 0;
+
+                    if (proto_read_frame(fd, &frame) < 0) {
+                        /* I/O error or clean EOF */
+                        server_del_fd(s, fd);
+                        session_remove(s, fd);
+                        close(fd);
+                        continue;
+                    }
+
+                    int err_code = proto_validate_header(&frame.hdr,
+                                                         &close_session);
+                    if (err_code != 0) {
+                        proto_send_err(fd, (uint16_t)err_code, NULL);
+                        proto_frame_free(&frame);
+                        if (close_session) {
+                            server_del_fd(s, fd);
+                            session_remove(s, fd);
+                            close(fd);
+                        }
+                        continue;
+                    }
+
+                    int rc = proto_dispatch(fd, &frame);
+                    proto_frame_free(&frame);
+
+                    if (rc < 0) {
+                        server_del_fd(s, fd);
+                        session_remove(s, fd);
+                        close(fd);
+                    }
                 }
             }
         }
@@ -216,8 +254,7 @@ void server_destroy(server_t *s)
         int fd = s->sessions[i].fd;
         if (fd < 0)
             continue;
-        (void)write(fd, NOTIFY_SERVER_CLOSING,
-                    sizeof(NOTIFY_SERVER_CLOSING) - 1);
+        (void)proto_send_ack(fd, MSG_NOTIFY_SERVER_CLOSE, NULL, 0);
         server_del_fd(s, fd);
         close(fd);
         s->sessions[i].fd = -1;
