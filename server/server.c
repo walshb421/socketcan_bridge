@@ -1,9 +1,11 @@
 #include "server.h"
 #include "proto.h"
+#include "session.h"
 
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <unistd.h>
@@ -24,7 +26,32 @@ static void session_add(server_t *s, int fd)
     }
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (s->sessions[i].fd < 0) {
-            s->sessions[i].fd = fd;
+            /* Create per-session timerfd for keep-alive enforcement */
+            int tfd = timerfd_create(CLOCK_MONOTONIC,
+                                     TFD_NONBLOCK | TFD_CLOEXEC);
+            if (tfd < 0) {
+                perror("timerfd_create");
+                close(fd);
+                return;
+            }
+
+            s->sessions[i].fd         = fd;
+            s->sessions[i].timer_fd   = tfd;
+            s->sessions[i].session_id = 0;
+            memset(s->sessions[i].client_name, 0,
+                   sizeof(s->sessions[i].client_name));
+
+            /* Arm immediately so unauthenticated connections also time out */
+            session_arm_timer(&s->sessions[i]);
+
+            if (server_add_fd(s, tfd, EPOLLIN) < 0) {
+                close(tfd);
+                close(fd);
+                s->sessions[i].fd       = -1;
+                s->sessions[i].timer_fd = -1;
+                return;
+            }
+
             s->nsessions++;
             return;
         }
@@ -37,7 +64,14 @@ static void session_remove(server_t *s, int fd)
 {
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (s->sessions[i].fd == fd) {
-            s->sessions[i].fd = -1;
+            int tfd = s->sessions[i].timer_fd;
+            if (tfd >= 0) {
+                server_del_fd(s, tfd);
+                close(tfd);
+                s->sessions[i].timer_fd = -1;
+            }
+            s->sessions[i].fd         = -1;
+            s->sessions[i].session_id = 0;
             s->nsessions--;
             return;
         }
@@ -82,8 +116,11 @@ int server_init(server_t *s, uint16_t port, const char *storage_dir)
     s->port       = port;
     s->storage_dir = storage_dir;
 
-    for (int i = 0; i < MAX_SESSIONS; i++)
-        s->sessions[i].fd = -1;
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        s->sessions[i].fd         = -1;
+        s->sessions[i].timer_fd   = -1;
+        s->sessions[i].session_id = 0;
+    }
 
     /* --- epoll instance --- */
     s->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
@@ -144,6 +181,10 @@ int server_init(server_t *s, uint16_t port, const char *storage_dir)
     if (server_add_fd(s, s->listen_fd, EPOLLIN) < 0)
         return -1;
 
+    /* --- Session module --- */
+    session_set_server(s);
+    session_register_handlers();
+
     printf("ash-server listening on port %u\n", (unsigned)port);
     return 0;
 }
@@ -169,7 +210,6 @@ void server_run(server_t *s)
             int fd = events[i].data.fd;
 
             if (fd == s->signal_fd) {
-                /* Drain the signalfd */
                 struct signalfd_siginfo ssi;
                 (void)read(s->signal_fd, &ssi, sizeof(ssi));
                 printf("ash-server received signal %u, shutting down\n",
@@ -177,7 +217,6 @@ void server_run(server_t *s)
                 return;
 
             } else if (fd == s->listen_fd) {
-                /* Accept loop */
                 for (;;) {
                     int cfd = accept4(s->listen_fd, NULL, NULL,
                                       SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -195,21 +234,42 @@ void server_run(server_t *s)
                 }
 
             } else {
+                /* Check if this fd is a keep-alive timerfd */
+                session_t *tsess = session_find_by_timer_fd(s, fd);
+                if (tsess) {
+                    uint64_t exp;
+                    (void)read(fd, &exp, sizeof(exp));  /* drain timerfd */
+                    int client_fd = tsess->fd;
+                    fprintf(stderr,
+                            "ash-server: session %u timed out (fd=%d), closing\n",
+                            tsess->session_id, client_fd);
+                    session_cleanup(s, tsess);
+                    server_del_fd(s, client_fd);
+                    session_remove(s, client_fd);   /* closes timer_fd too */
+                    close(client_fd);
+                    continue;
+                }
+
                 /* Client fd: error / hangup / peer closed */
                 if (events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) {
+                    session_t *sess = session_find_by_fd(s, fd);
+                    if (sess)
+                        session_cleanup(s, sess);
                     server_del_fd(s, fd);
                     session_remove(s, fd);
                     close(fd);
                     continue;
                 }
 
-                /* Client fd: data available — read and dispatch one frame */
+                /* Client fd: data available */
                 if (events[i].events & EPOLLIN) {
                     proto_frame_t frame;
                     int close_session = 0;
 
                     if (proto_read_frame(fd, &frame) < 0) {
-                        /* I/O error or clean EOF */
+                        session_t *sess = session_find_by_fd(s, fd);
+                        if (sess)
+                            session_cleanup(s, sess);
                         server_del_fd(s, fd);
                         session_remove(s, fd);
                         close(fd);
@@ -222,6 +282,9 @@ void server_run(server_t *s)
                         proto_send_err(fd, (uint16_t)err_code, NULL);
                         proto_frame_free(&frame);
                         if (close_session) {
+                            session_t *sess = session_find_by_fd(s, fd);
+                            if (sess)
+                                session_cleanup(s, sess);
                             server_del_fd(s, fd);
                             session_remove(s, fd);
                             close(fd);
@@ -229,10 +292,25 @@ void server_run(server_t *s)
                         continue;
                     }
 
+                    /* Reset keep-alive timer on any message from an
+                     * established session (SESSION_INIT arms it itself) */
+                    session_t *sess = session_find_by_fd(s, fd);
+                    if (sess && sess->session_id != 0)
+                        session_arm_timer(sess);
+
+                    /* Session guard: check state vs message type */
+                    if (session_guard(fd, frame.hdr.msg_type) != 0) {
+                        proto_frame_free(&frame);
+                        continue;
+                    }
+
                     int rc = proto_dispatch(fd, &frame);
                     proto_frame_free(&frame);
 
                     if (rc < 0) {
+                        session_t *csess = session_find_by_fd(s, fd);
+                        if (csess)
+                            session_cleanup(s, csess);
                         server_del_fd(s, fd);
                         session_remove(s, fd);
                         close(fd);
@@ -249,13 +327,19 @@ void server_run(server_t *s)
 
 void server_destroy(server_t *s)
 {
-    /* Notify and close all connected clients */
     for (int i = 0; i < MAX_SESSIONS; i++) {
         int fd = s->sessions[i].fd;
         if (fd < 0)
             continue;
+        session_cleanup(s, &s->sessions[i]);
         (void)proto_send_ack(fd, MSG_NOTIFY_SERVER_CLOSE, NULL, 0);
         server_del_fd(s, fd);
+        int tfd = s->sessions[i].timer_fd;
+        if (tfd >= 0) {
+            server_del_fd(s, tfd);
+            close(tfd);
+            s->sessions[i].timer_fd = -1;
+        }
         close(fd);
         s->sessions[i].fd = -1;
     }

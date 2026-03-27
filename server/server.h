@@ -1,14 +1,19 @@
 #ifndef ASH_SERVER_H
 #define ASH_SERVER_H
 
+#include "ash/proto.h"
 #include <stdint.h>
 #include <sys/epoll.h>
 
 #define MAX_SESSIONS          1024
 #define DEFAULT_PORT          4000
+#define KEEPALIVE_TIMEOUT_SEC 30
 
 typedef struct {
-    int fd;
+    int      fd;
+    int      timer_fd;
+    uint32_t session_id;                       /* 0 = not yet established */
+    char     client_name[PROTO_MAX_NAME + 1];
 } session_t;
 
 typedef struct {
