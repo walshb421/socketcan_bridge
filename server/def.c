@@ -149,8 +149,22 @@ static int pdu_has_dependents(const char *pdu_name)
 }
 
 /* -------------------------------------------------------------------------
- * Wire read helper for IEEE 754 doubles stored big-endian
+ * Wire helpers for IEEE 754 doubles (read/write big-endian)
  * ---------------------------------------------------------------------- */
+
+static void write_be_double(uint8_t *p, double d)
+{
+    uint64_t raw;
+    memcpy(&raw, &d, sizeof(raw));
+    p[0] = (uint8_t)((raw >> 56) & 0xFF);
+    p[1] = (uint8_t)((raw >> 48) & 0xFF);
+    p[2] = (uint8_t)((raw >> 40) & 0xFF);
+    p[3] = (uint8_t)((raw >> 32) & 0xFF);
+    p[4] = (uint8_t)((raw >> 24) & 0xFF);
+    p[5] = (uint8_t)((raw >> 16) & 0xFF);
+    p[6] = (uint8_t)((raw >>  8) & 0xFF);
+    p[7] = (uint8_t)( raw        & 0xFF);
+}
 
 static double read_be_double(const uint8_t *p)
 {
@@ -605,4 +619,316 @@ void def_register_handlers(void)
     proto_register_handler(MSG_DEF_PDU,    handle_def_pdu);
     proto_register_handler(MSG_DEF_FRAME,  handle_def_frame);
     proto_register_handler(MSG_DEF_DELETE, handle_def_delete);
+}
+
+/* -------------------------------------------------------------------------
+ * Serialization helpers
+ * ---------------------------------------------------------------------- */
+
+static int buf_write(uint8_t *buf, size_t bufsz, size_t *pos,
+                     const void *data, size_t len)
+{
+    if (*pos + len > bufsz)
+        return -1;
+    memcpy(buf + *pos, data, len);
+    *pos += len;
+    return 0;
+}
+
+static int buf_write1(uint8_t *buf, size_t bufsz, size_t *pos, uint8_t b)
+{
+    return buf_write(buf, bufsz, pos, &b, 1);
+}
+
+/* -------------------------------------------------------------------------
+ * def_serialize_entries  (SPEC §9.2)
+ * ---------------------------------------------------------------------- */
+
+ssize_t def_serialize_entries(uint8_t *buf, size_t bufsize, uint16_t *count_out)
+{
+    size_t   pos   = 0;
+    uint16_t count = 0;
+
+    /* ── Signals ── */
+    for (int i = 0; i < g_signal_count; i++) {
+        const signal_def_t *s = &g_signals[i];
+        uint8_t name_len = (uint8_t)strlen(s->name);
+
+        if (buf_write1(buf, bufsize, &pos, DEF_TYPE_SIGNAL) < 0) return -1;
+        size_t len_pos = pos; pos += 2;   /* reserve payload-length field */
+        if (pos > bufsize) return -1;
+        size_t payload_start = pos;
+
+        if (buf_write1(buf, bufsize, &pos, name_len)            < 0) return -1;
+        if (buf_write(buf, bufsize, &pos, s->name, name_len)    < 0) return -1;
+        if (buf_write1(buf, bufsize, &pos, s->data_type)        < 0) return -1;
+        if (buf_write1(buf, bufsize, &pos, s->byte_order)       < 0) return -1;
+        if (buf_write1(buf, bufsize, &pos, s->bit_length)       < 0) return -1;
+
+        uint8_t dbl[8];
+        write_be_double(dbl, s->scale);
+        if (buf_write(buf, bufsize, &pos, dbl, 8) < 0) return -1;
+        write_be_double(dbl, s->offset_val);
+        if (buf_write(buf, bufsize, &pos, dbl, 8) < 0) return -1;
+        write_be_double(dbl, s->min_val);
+        if (buf_write(buf, bufsize, &pos, dbl, 8) < 0) return -1;
+        write_be_double(dbl, s->max_val);
+        if (buf_write(buf, bufsize, &pos, dbl, 8) < 0) return -1;
+
+        uint16_t plen  = (uint16_t)(pos - payload_start);
+        buf[len_pos]   = (uint8_t)((plen >> 8) & 0xFF);
+        buf[len_pos+1] = (uint8_t)(plen & 0xFF);
+        count++;
+    }
+
+    /* ── PDUs ── */
+    for (int i = 0; i < g_pdu_count; i++) {
+        const pdu_def_t *pu = &g_pdus[i];
+        uint8_t name_len = (uint8_t)strlen(pu->name);
+
+        if (buf_write1(buf, bufsize, &pos, DEF_TYPE_PDU) < 0) return -1;
+        size_t len_pos = pos; pos += 2;
+        if (pos > bufsize) return -1;
+        size_t payload_start = pos;
+
+        if (buf_write1(buf, bufsize, &pos, name_len)              < 0) return -1;
+        if (buf_write(buf, bufsize, &pos, pu->name, name_len)     < 0) return -1;
+        if (buf_write1(buf, bufsize, &pos, pu->length)            < 0) return -1;
+        if (buf_write1(buf, bufsize, &pos, pu->signal_count)      < 0) return -1;
+
+        for (int j = 0; j < (int)pu->signal_count; j++) {
+            uint8_t slen = (uint8_t)strlen(pu->signals[j].sig_name);
+            if (buf_write1(buf, bufsize, &pos, slen)                         < 0) return -1;
+            if (buf_write(buf, bufsize, &pos, pu->signals[j].sig_name, slen) < 0) return -1;
+            if (buf_write1(buf, bufsize, &pos, pu->signals[j].start_bit)     < 0) return -1;
+        }
+
+        uint16_t plen  = (uint16_t)(pos - payload_start);
+        buf[len_pos]   = (uint8_t)((plen >> 8) & 0xFF);
+        buf[len_pos+1] = (uint8_t)(plen & 0xFF);
+        count++;
+    }
+
+    /* ── Frames ── */
+    for (int i = 0; i < g_frame_count; i++) {
+        const frame_def_t *fr = &g_frames[i];
+        uint8_t name_len = (uint8_t)strlen(fr->name);
+
+        if (buf_write1(buf, bufsize, &pos, DEF_TYPE_FRAME) < 0) return -1;
+        size_t len_pos = pos; pos += 2;
+        if (pos > bufsize) return -1;
+        size_t payload_start = pos;
+
+        if (buf_write1(buf, bufsize, &pos, name_len)               < 0) return -1;
+        if (buf_write(buf, bufsize, &pos, fr->name, name_len)      < 0) return -1;
+
+        uint8_t can_id_buf[4] = {
+            (uint8_t)((fr->can_id >> 24) & 0xFF),
+            (uint8_t)((fr->can_id >> 16) & 0xFF),
+            (uint8_t)((fr->can_id >>  8) & 0xFF),
+            (uint8_t)( fr->can_id        & 0xFF)
+        };
+        if (buf_write(buf, bufsize, &pos, can_id_buf, 4)           < 0) return -1;
+        if (buf_write1(buf, bufsize, &pos, fr->id_type)            < 0) return -1;
+        if (buf_write1(buf, bufsize, &pos, fr->dlc)                < 0) return -1;
+
+        uint8_t period_buf[2] = {
+            (uint8_t)((fr->tx_period >> 8) & 0xFF),
+            (uint8_t)( fr->tx_period       & 0xFF)
+        };
+        if (buf_write(buf, bufsize, &pos, period_buf, 2)           < 0) return -1;
+        if (buf_write1(buf, bufsize, &pos, fr->pdu_count)          < 0) return -1;
+
+        for (int j = 0; j < (int)fr->pdu_count; j++) {
+            uint8_t plen2 = (uint8_t)strlen(fr->pdus[j].pdu_name);
+            if (buf_write1(buf, bufsize, &pos, plen2)                           < 0) return -1;
+            if (buf_write(buf, bufsize, &pos, fr->pdus[j].pdu_name, plen2)      < 0) return -1;
+            if (buf_write1(buf, bufsize, &pos, fr->pdus[j].byte_offset)         < 0) return -1;
+        }
+
+        uint16_t plen  = (uint16_t)(pos - payload_start);
+        buf[len_pos]   = (uint8_t)((plen >> 8) & 0xFF);
+        buf[len_pos+1] = (uint8_t)(plen & 0xFF);
+        count++;
+    }
+
+    if (count_out)
+        *count_out = count;
+    return (ssize_t)pos;
+}
+
+/* -------------------------------------------------------------------------
+ * def_validate_entry  — conflict-check only, no apply
+ * ---------------------------------------------------------------------- */
+
+int def_validate_entry(uint8_t entry_type, const uint8_t *payload, uint32_t len)
+{
+    if (entry_type < DEF_TYPE_SIGNAL || entry_type > DEF_TYPE_FRAME)
+        return DEF_APPLY_INVALID;
+    if (len < 2u)
+        return DEF_APPLY_INVALID;
+
+    uint8_t name_len = payload[0];
+    if (name_len == 0 || name_len > PROTO_MAX_NAME ||
+        len < (uint32_t)(1u + name_len))
+        return DEF_APPLY_INVALID;
+
+    char name[PROTO_MAX_NAME + 1];
+    memcpy(name, payload + 1, name_len);
+    name[name_len] = '\0';
+
+    uint8_t existing = namespace_type(name);
+    if (existing != 0 && existing != entry_type)
+        return DEF_APPLY_CONFLICT;
+
+    return DEF_APPLY_OK;
+}
+
+/* -------------------------------------------------------------------------
+ * def_apply_entry  — full parse + insert/overwrite
+ * ---------------------------------------------------------------------- */
+
+void def_apply_entry(uint8_t entry_type, const uint8_t *payload, uint32_t len)
+{
+    if (len < 2u)
+        return;
+
+    uint8_t name_len = payload[0];
+    if (name_len == 0 || name_len > PROTO_MAX_NAME ||
+        len < (uint32_t)(1u + name_len))
+        return;
+
+    char name[PROTO_MAX_NAME + 1];
+    memcpy(name, payload + 1, name_len);
+    name[name_len] = '\0';
+
+    const uint8_t *p         = payload + 1 + name_len;
+    uint32_t       remaining = len - 1u - name_len;
+
+    if (entry_type == DEF_TYPE_SIGNAL) {
+        if (remaining < 35u) return;
+
+        uint8_t data_type  = *p++; remaining--;
+        uint8_t byte_order = *p++; remaining--;
+        uint8_t bit_length = *p++; remaining--;
+
+        if (data_type < 0x01u || data_type > 0x03u ||
+            byte_order < 0x01u || byte_order > 0x02u ||
+            bit_length == 0)
+            return;
+
+        double scale      = read_be_double(p); p += 8; remaining -= 8;
+        double offset_val = read_be_double(p); p += 8; remaining -= 8;
+        double min_val    = read_be_double(p); p += 8; remaining -= 8;
+        double max_val    = read_be_double(p); p += 8; remaining -= 8;
+        (void)remaining;
+
+        signal_def_t *slot = signal_find(name);
+        if (!slot) {
+            if (g_signal_count >= MAX_SIGNALS) return;
+            slot = &g_signals[g_signal_count++];
+        }
+        memcpy(slot->name, name, name_len + 1);
+        slot->data_type  = data_type;
+        slot->byte_order = byte_order;
+        slot->bit_length = bit_length;
+        slot->scale      = scale;
+        slot->offset_val = offset_val;
+        slot->min_val    = min_val;
+        slot->max_val    = max_val;
+
+    } else if (entry_type == DEF_TYPE_PDU) {
+        if (remaining < 2u) return;
+
+        uint8_t pdu_length   = *p++; remaining--;
+        uint8_t signal_count = *p++; remaining--;
+
+        if (signal_count > MAX_SIGNALS_PER_PDU) return;
+
+        pdu_signal_mapping_t mappings[MAX_SIGNALS_PER_PDU];
+
+        for (int i = 0; i < (int)signal_count; i++) {
+            if (remaining < 1u) return;
+            uint8_t sname_len = *p++; remaining--;
+
+            if (sname_len == 0 || sname_len > PROTO_MAX_NAME ||
+                remaining < (uint32_t)sname_len + 1u)
+                return;
+
+            char sname[PROTO_MAX_NAME + 1];
+            memcpy(sname, p, sname_len);
+            sname[sname_len] = '\0';
+            p += sname_len; remaining -= sname_len;
+
+            uint8_t start_bit = *p++; remaining--;
+
+            if (!signal_find(sname)) return;   /* reference must exist */
+
+            memcpy(mappings[i].sig_name, sname, sname_len + 1);
+            mappings[i].start_bit = start_bit;
+        }
+
+        pdu_def_t *slot = pdu_find(name);
+        if (!slot) {
+            if (g_pdu_count >= MAX_PDUS) return;
+            slot = &g_pdus[g_pdu_count++];
+        }
+        memcpy(slot->name, name, name_len + 1);
+        slot->length       = pdu_length;
+        slot->signal_count = signal_count;
+        memcpy(slot->signals, mappings, signal_count * sizeof(pdu_signal_mapping_t));
+
+    } else if (entry_type == DEF_TYPE_FRAME) {
+        if (remaining < 9u) return;
+
+        uint32_t can_id = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+                        | ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
+        p += 4; remaining -= 4;
+
+        uint8_t  id_type   = *p++; remaining--;
+        uint8_t  dlc       = *p++; remaining--;
+        uint16_t tx_period = (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+        p += 2; remaining -= 2;
+        uint8_t  pdu_count = *p++; remaining--;
+
+        if ((id_type != 0x01u && id_type != 0x02u) ||
+            pdu_count > MAX_PDUS_PER_FRAME)
+            return;
+
+        frame_pdu_mapping_t mappings[MAX_PDUS_PER_FRAME];
+
+        for (int i = 0; i < (int)pdu_count; i++) {
+            if (remaining < 1u) return;
+            uint8_t pname_len = *p++; remaining--;
+
+            if (pname_len == 0 || pname_len > PROTO_MAX_NAME ||
+                remaining < (uint32_t)pname_len + 1u)
+                return;
+
+            char pname[PROTO_MAX_NAME + 1];
+            memcpy(pname, p, pname_len);
+            pname[pname_len] = '\0';
+            p += pname_len; remaining -= pname_len;
+
+            uint8_t byte_offset = *p++; remaining--;
+
+            if (!pdu_find(pname)) return;       /* reference must exist */
+
+            memcpy(mappings[i].pdu_name, pname, pname_len + 1);
+            mappings[i].byte_offset = byte_offset;
+        }
+
+        frame_def_t *slot = frame_find(name);
+        if (!slot) {
+            if (g_frame_count >= MAX_FRAMES) return;
+            slot = &g_frames[g_frame_count++];
+        }
+        memcpy(slot->name, name, name_len + 1);
+        slot->can_id    = can_id;
+        slot->id_type   = id_type;
+        slot->dlc       = dlc;
+        slot->tx_period = tx_period;
+        slot->pdu_count = pdu_count;
+        memcpy(slot->pdus, mappings, pdu_count * sizeof(frame_pdu_mapping_t));
+    }
 }

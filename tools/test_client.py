@@ -4,6 +4,7 @@ ash protocol test client — exercises wire protocol and session lifecycle.
 
 Usage:
     ./tools/test_client.py [--host HOST] [--port PORT] [--test N]
+                           [--storage-dir DIR]
 
 Default host/port: 127.0.0.1:4000
 
@@ -14,6 +15,9 @@ Tests 18-28 (definition store) run automatically.
 Tests 29-36 (signal ownership) run automatically.
 Tests 37-39 (CAP_NET_ADMIN) run automatically; they self-skip when the server
 holds CAP_NET_ADMIN.
+Tests 40-43 (configuration persistence) run automatically; tests 40, 42, and 43
+self-skip when the server has no storage dir.  Pass --storage-dir to match the
+directory given to ash-server --storage-dir.
 Test 8 (graceful server shutdown) requires manually stopping the server and
 must be requested with --test 8.
 Test 9 (keep-alive timeout) waits 30+ seconds and must be requested with --test 9.
@@ -22,6 +26,7 @@ waits, and must be requested with --test 17.
 """
 
 import argparse
+import os
 import socket
 import struct
 import sys
@@ -83,6 +88,15 @@ ERR_DEF_INVALID   = 0x0020
 ERR_DEF_CONFLICT  = 0x0021
 ERR_DEF_IN_USE    = 0x0022
 
+# Configuration persistence (SPEC §9)
+MSG_CFG_SAVE    = 0x0040
+MSG_CFG_LOAD    = 0x0041
+MSG_CFG_ACK     = 0x8040
+
+ERR_CFG_IO        = 0x0040
+ERR_CFG_CHECKSUM  = 0x0041
+ERR_CFG_CONFLICT  = 0x0042
+
 DEF_TYPE_SIGNAL = 0x01
 DEF_TYPE_PDU    = 0x02
 DEF_TYPE_FRAME  = 0x03
@@ -91,6 +105,9 @@ KEEPALIVE_TIMEOUT_SEC    = 30
 
 # vcan interface name used by tests 10-17
 TEST_VCAN = 'vcan99'
+
+# Storage directory for cfg tests 40-43 (set from --storage-dir in main)
+_storage_dir = None
 
 # ── Frame helpers ─────────────────────────────────────────────────────────────
 
@@ -176,6 +193,9 @@ MSG_NAMES = {
     0x0033: 'OWN_UNLOCK',
     0x8030: 'OWN_ACK',
     0x9001: 'NOTIFY_OWN_REVOKED',
+    0x0040: 'CFG_SAVE',
+    0x0041: 'CFG_LOAD',
+    0x8040: 'CFG_ACK',
     0xFFFF: 'MSG_ERR',
 }
 
@@ -195,6 +215,9 @@ ERR_NAMES = {
     0x0022: 'ERR_DEF_IN_USE',
     0x0030: 'ERR_OWN_NOT_AVAILABLE',
     0x0031: 'ERR_OWN_NOT_HELD',
+    0x0040: 'ERR_CFG_IO',
+    0x0041: 'ERR_CFG_CHECKSUM',
+    0x0042: 'ERR_CFG_CONFLICT',
 }
 
 def fmt_type(t):
@@ -1521,6 +1544,218 @@ def test_own_session_close_releases(host, port):
         _delete_signal(s2, 't36_sig')
 
 
+# ── Configuration persistence helpers ────────────────────────────────────────
+
+def make_cfg_save(name):
+    """Build a CFG_SAVE frame (SPEC §9.3)."""
+    n = name.encode()
+    return make_frame(PROTO_VERSION, MSG_CFG_SAVE, bytes([len(n)]) + n)
+
+
+def make_cfg_load(name):
+    """Build a CFG_LOAD frame (SPEC §9.4)."""
+    n = name.encode()
+    return make_frame(PROTO_VERSION, MSG_CFG_LOAD, bytes([len(n)]) + n)
+
+
+# ── Configuration persistence tests (SPEC §9) ─────────────────────────────────
+
+def test_cfg_save_load_roundtrip(host, port):
+    """Test 40 — CFG_SAVE / CFG_LOAD round-trip.
+
+    Defines a signal, saves the store, deletes the signal, reloads, and
+    verifies the signal is accessible again.  Self-skips when the server has
+    no storage directory (CFG_SAVE returns ERR_CFG_IO).
+    """
+    print('\n[40] CFG_SAVE/LOAD round-trip — save defs, delete, reload, verify')
+    with open_session(host, port, 'cfg-roundtrip')[0] as s:
+        if not _define_signal(s, 't40_sig'):
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+
+        # Save
+        s.sendall(make_cfg_save('t40_rt'))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response to CFG_SAVE'):
+            def_cleanup(s, ('t40_sig', DEF_TYPE_SIGNAL))
+            return
+        _, msg_type, payload = frame
+        if msg_type == MSG_ERR:
+            code, _ = decode_err(payload)
+            if code == ERR_CFG_IO:
+                print('  [skip] server has no storage dir — start with --storage-dir')
+                def_cleanup(s, ('t40_sig', DEF_TYPE_SIGNAL))
+                return
+        if not check(msg_type == MSG_CFG_ACK,
+                     f'CFG_SAVE → CFG_ACK (got {fmt_type(msg_type)})'):
+            def_cleanup(s, ('t40_sig', DEF_TYPE_SIGNAL))
+            return
+
+        # Delete the signal (no deps)
+        s.sendall(make_def_delete('t40_sig', DEF_TYPE_SIGNAL))
+        if recv_frame(s) is None:
+            check(False, 'DEF_DELETE prerequisite failed')
+            return
+
+        # Reload
+        s.sendall(make_cfg_load('t40_rt'))
+        frame2 = recv_frame(s)
+        print_response(frame2)
+        if not check(frame2 is not None, 'received a response to CFG_LOAD'):
+            return
+        _, msg_type2, _ = frame2
+        if not check(msg_type2 == MSG_CFG_ACK,
+                     f'CFG_LOAD → CFG_ACK (got {fmt_type(msg_type2)})'):
+            return
+
+        # Verify signal is back by defining a PDU referencing it
+        s.sendall(make_def_pdu('t40_pdu', 8, [('t40_sig', 0)]))
+        frame3 = recv_frame(s)
+        if not check(frame3 is not None and frame3[1] == MSG_DEF_ACK,
+                     'signal accessible after reload (DEF_PDU → DEF_ACK)'):
+            def_cleanup(s, ('t40_sig', DEF_TYPE_SIGNAL))
+            return
+
+        def_cleanup(s, ('t40_sig', DEF_TYPE_SIGNAL), ('t40_pdu', DEF_TYPE_PDU))
+
+
+def test_cfg_load_nonexistent(host, port):
+    """Test 41 — CFG_LOAD of a nonexistent config name → ERR_CFG_IO."""
+    print('\n[41] CFG_LOAD nonexistent name — expect ERR_CFG_IO')
+    with open_session(host, port, 'cfg-nofile')[0] as s:
+        s.sendall(make_cfg_load('t41_no_such_config_xyz'))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            return
+        _, msg_type, payload = frame
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload)
+        check(code == ERR_CFG_IO,
+              f'err_code is ERR_CFG_IO (got {fmt_err(code)})')
+
+
+def test_cfg_load_conflict(host, port):
+    """Test 42 — CFG_LOAD conflicts with in-memory type → ERR_CFG_CONFLICT.
+
+    Saves a signal named 't42_name', then redefines 't42_name' as a PDU, then
+    loads the saved file — the file has a signal where memory has a PDU.
+    Self-skips when the server has no storage directory.
+    """
+    print('\n[42] CFG_LOAD conflict — file has signal X, memory has PDU X → ERR_CFG_CONFLICT')
+    with open_session(host, port, 'cfg-conflict')[0] as s:
+        # Define signal t42_name
+        if not _define_signal(s, 't42_name'):
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+
+        # Save (file will contain signal t42_name)
+        s.sendall(make_cfg_save('t42_conf'))
+        frame = recv_frame(s)
+        if frame is None:
+            check(False, 'CFG_SAVE prerequisite: no response')
+            def_cleanup(s, ('t42_name', DEF_TYPE_SIGNAL))
+            return
+        _, msg_type, payload = frame
+        if msg_type == MSG_ERR:
+            code, _ = decode_err(payload)
+            if code == ERR_CFG_IO:
+                print('  [skip] server has no storage dir — start with --storage-dir')
+                def_cleanup(s, ('t42_name', DEF_TYPE_SIGNAL))
+                return
+        if msg_type != MSG_CFG_ACK:
+            check(False, f'CFG_SAVE prerequisite failed (got {fmt_type(msg_type)})')
+            def_cleanup(s, ('t42_name', DEF_TYPE_SIGNAL))
+            return
+
+        # Delete signal t42_name so we can redefine it as a PDU
+        s.sendall(make_def_delete('t42_name', DEF_TYPE_SIGNAL))
+        if recv_frame(s) is None:
+            check(False, 'DEF_DELETE prerequisite failed')
+            return
+
+        # Define t42_helper (needed for the PDU to reference)
+        if not _define_signal(s, 't42_helper'):
+            check(False, 'DEF_SIGNAL (helper) prerequisite failed')
+            return
+
+        # Redefine t42_name as a PDU
+        s.sendall(make_def_pdu('t42_name', 8, [('t42_helper', 0)]))
+        if recv_frame(s) is None:
+            check(False, 'DEF_PDU prerequisite failed')
+            def_cleanup(s, ('t42_helper', DEF_TYPE_SIGNAL))
+            return
+
+        # Load — file has signal t42_name, memory has PDU t42_name → conflict
+        s.sendall(make_cfg_load('t42_conf'))
+        frame2 = recv_frame(s)
+        print_response(frame2)
+        if not check(frame2 is not None, 'received a response to CFG_LOAD'):
+            def_cleanup(s, ('t42_helper', DEF_TYPE_SIGNAL),
+                        ('t42_name', DEF_TYPE_PDU))
+            return
+        _, msg_type2, payload2 = frame2
+        check(msg_type2 == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type2)})')
+        code2, _ = decode_err(payload2)
+        check(code2 == ERR_CFG_CONFLICT,
+              f'err_code is ERR_CFG_CONFLICT (got {fmt_err(code2)})')
+
+        def_cleanup(s, ('t42_helper', DEF_TYPE_SIGNAL), ('t42_name', DEF_TYPE_PDU))
+
+
+def test_cfg_load_bad_checksum(host, port):
+    """Test 43 — CFG_LOAD of a file with a corrupted CRC → ERR_CFG_CHECKSUM.
+
+    Writes a minimal .ashcfg file with a deliberately wrong CRC into the
+    storage directory.  Requires --storage-dir to match the server's
+    --storage-dir; self-skips otherwise.
+    """
+    print('\n[43] CFG_LOAD bad checksum — expect ERR_CFG_CHECKSUM'
+          ' (skipped if --storage-dir not provided)')
+    if not _storage_dir:
+        print('  [skip] --storage-dir not provided')
+        return
+
+    # Write a file with valid header fields but CRC = 0x00000000 (wrong)
+    path = os.path.join(_storage_dir, 't43_badcrc.ashcfg')
+    magic   = 0x41534843
+    version = 0x0001
+    count   = 0
+    bad_crc = 0x00000000   # intentionally wrong (correct CRC for empty body ≠ 0)
+    # '>IHHI': magic(uint32) + version(uint16) + count(uint16) + crc(uint32)
+    header = struct.pack('>I', magic) + struct.pack('>H', version) + \
+             struct.pack('>H', count) + struct.pack('>I', bad_crc)
+
+    try:
+        os.makedirs(_storage_dir, exist_ok=True)
+        with open(path, 'wb') as f:
+            f.write(header)
+    except OSError as e:
+        print(f'  [skip] cannot write to storage dir: {e}')
+        return
+
+    with open_session(host, port, 'cfg-badcrc')[0] as s:
+        s.sendall(make_cfg_load('t43_badcrc'))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            return
+        _, msg_type, payload = frame
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload)
+        check(code == ERR_CFG_CHECKSUM,
+              f'err_code is ERR_CFG_CHECKSUM (got {fmt_err(code)})')
+
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 # ── CAP_NET_ADMIN tests ───────────────────────────────────────────────────────
 
 ERR_PERMISSION_DENIED = 0x0013
@@ -1665,19 +1900,29 @@ TESTS = [
     test_cap_net_admin_vcan_create,     # 37
     test_cap_net_admin_vcan_destroy,    # 38
     test_cap_net_admin_attach_bitrate,  # 39
+    test_cfg_save_load_roundtrip,       # 40
+    test_cfg_load_nonexistent,          # 41
+    test_cfg_load_conflict,             # 42
+    test_cfg_load_bad_checksum,         # 43
 ]
 
-AUTO_TESTS = TESTS[:7] + TESTS[9:16] + TESTS[17:]  # 1-7, 10-16, and 18-39 run unattended
+AUTO_TESTS = TESTS[:7] + TESTS[9:16] + TESTS[17:]  # 1-7, 10-16, and 18-43 run unattended
 
 
 def main():
+    global _storage_dir
+
     parser = argparse.ArgumentParser(
         description='ash protocol + session lifecycle test client')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=4000)
+    parser.add_argument('--storage-dir', default=None,
+                        help='path matching ash-server --storage-dir (needed for tests 40, 42, 43)')
     parser.add_argument('--test', type=int, choices=range(1, len(TESTS) + 1),
                         metavar='N', help=f'run only test N (1-{len(TESTS)})')
     args = parser.parse_args()
+
+    _storage_dir = args.storage_dir
 
     print(f'ash test client — {args.host}:{args.port}')
 
@@ -1697,7 +1942,7 @@ def main():
         print('\n[8]  Graceful shutdown    — run with --test 8')
         print('[9]  Keep-alive timeout  — run with --test 9 (takes 35 s)')
         print('[17] NOTIFY_IFACE_DOWN   — run with --test 17 (requires manual ip link delete)')
-        print('     (Tests 18-28 run automatically above)')
+        print('     (Tests 18-43 run automatically above)')
 
     print()
 
