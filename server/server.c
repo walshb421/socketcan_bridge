@@ -1,6 +1,7 @@
 #include "server.h"
 #include "proto.h"
 #include "session.h"
+#include "iface.h"
 
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
@@ -113,6 +114,7 @@ int server_init(server_t *s, uint16_t port, const char *storage_dir)
     s->epoll_fd   = -1;
     s->listen_fd  = -1;
     s->signal_fd  = -1;
+    s->netlink_fd = -1;
     s->port       = port;
     s->storage_dir = storage_dir;
 
@@ -185,6 +187,10 @@ int server_init(server_t *s, uint16_t port, const char *storage_dir)
     session_set_server(s);
     session_register_handlers();
 
+    /* --- Interface module --- */
+    if (iface_init(s) < 0)
+        return -1;
+
     printf("ash-server listening on port %u\n", (unsigned)port);
     return 0;
 }
@@ -232,6 +238,9 @@ void server_run(server_t *s)
                     }
                     session_add(s, cfd);
                 }
+
+            } else if (fd == s->netlink_fd) {
+                iface_handle_netlink();
 
             } else {
                 /* Check if this fd is a keep-alive timerfd */
@@ -344,6 +353,8 @@ void server_destroy(server_t *s)
         s->sessions[i].fd = -1;
     }
 
+    iface_destroy();
+
     if (s->listen_fd >= 0) {
         close(s->listen_fd);
         s->listen_fd = -1;
@@ -351,6 +362,9 @@ void server_destroy(server_t *s)
     if (s->signal_fd >= 0) {
         close(s->signal_fd);
         s->signal_fd = -1;
+    }
+    if (s->netlink_fd >= 0) {
+        s->netlink_fd = -1;   /* already closed by iface_destroy() */
     }
     if (s->epoll_fd >= 0) {
         close(s->epoll_fd);
