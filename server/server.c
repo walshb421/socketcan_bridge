@@ -2,6 +2,7 @@
 #include "proto.h"
 #include "session.h"
 #include "iface.h"
+#include "def.h"
 
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
@@ -191,6 +192,10 @@ int server_init(server_t *s, uint16_t port, const char *storage_dir)
     if (iface_init(s) < 0)
         return -1;
 
+    /* --- Definition store --- */
+    def_init();
+    def_register_handlers();
+
     printf("ash-server listening on port %u\n", (unsigned)port);
     return 0;
 }
@@ -353,6 +358,7 @@ void server_destroy(server_t *s)
         s->sessions[i].fd = -1;
     }
 
+    def_destroy();
     iface_destroy();
 
     if (s->listen_fd >= 0) {
