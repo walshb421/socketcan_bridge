@@ -17,6 +17,30 @@
 #include <errno.h>
 
 /* -------------------------------------------------------------------------
+ * CAP_NET_ADMIN probe  (reads /proc/self/status — no libcap dependency)
+ * ---------------------------------------------------------------------- */
+
+static uint8_t probe_cap_net_admin(void)
+{
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f)
+        return 0;
+
+    char line[256];
+    unsigned long long capeff = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "CapEff:", 7) == 0) {
+            sscanf(line + 7, "%llx", &capeff);
+            break;
+        }
+    }
+    fclose(f);
+
+    /* CAP_NET_ADMIN is bit 12 of the effective capability set */
+    return (uint8_t)((capeff >> 12) & 1u);
+}
+
+/* -------------------------------------------------------------------------
  * Static helpers
  * ---------------------------------------------------------------------- */
 
@@ -184,6 +208,13 @@ int server_init(server_t *s, uint16_t port, const char *storage_dir)
 
     if (server_add_fd(s, s->listen_fd, EPOLLIN) < 0)
         return -1;
+
+    /* --- Capability check --- */
+    s->has_cap_net_admin = probe_cap_net_admin();
+    if (!s->has_cap_net_admin)
+        fprintf(stderr,
+                "ash-server: warning: CAP_NET_ADMIN not held — "
+                "vcan create/destroy and bitrate configuration unavailable\n");
 
     /* --- Session module --- */
     session_set_server(s);

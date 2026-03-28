@@ -606,6 +606,12 @@ static int handle_iface_attach(int fd, const proto_frame_t *frame)
         return 0;
     }
 
+    /* Bitrate configuration requires CAP_NET_ADMIN */
+    if (bitrate != 0 && !g_server->has_cap_net_admin) {
+        proto_send_err(fd, ERR_PERMISSION_DENIED, NULL);
+        return 0;
+    }
+
     /* Optionally configure bitrate */
     if (bitrate != 0 && iface_set_bitrate(name, bitrate) < 0)
         fprintf(stderr, "ash-server: bitrate config failed for %s (continuing)\n",
@@ -759,6 +765,11 @@ static int handle_iface_vcan_create(int fd, const proto_frame_t *frame)
     memcpy(name, &frame->payload[1], name_len);
     name[name_len] = '\0';
 
+    if (!g_server->has_cap_net_admin) {
+        proto_send_err(fd, ERR_PERMISSION_DENIED, NULL);
+        return 0;
+    }
+
     if (vcan_create(name) < 0) {
         fprintf(stderr, "ash-server: vcan_create(%s) failed: %s\n",
                 name, strerror(errno));
@@ -794,6 +805,11 @@ static int handle_iface_vcan_destroy(int fd, const proto_frame_t *frame)
     char name[PROTO_MAX_NAME + 1];
     memcpy(name, &frame->payload[1], name_len);
     name[name_len] = '\0';
+
+    if (!g_server->has_cap_net_admin) {
+        proto_send_err(fd, ERR_PERMISSION_DENIED, NULL);
+        return 0;
+    }
 
     if (vcan_destroy(name) < 0) {
         proto_send_err(fd, ERR_IFACE_NOT_FOUND, NULL);
