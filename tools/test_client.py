@@ -10,6 +10,7 @@ Default host/port: 127.0.0.1:4000
 Tests 1-7 run automatically.
 Tests 10-16 (CAN interface management) run automatically; the server must have
 CAP_NET_ADMIN (root) to create/destroy vcan interfaces.
+Tests 18-28 (definition store) run automatically.
 Test 8 (graceful server shutdown) requires manually stopping the server and
 must be requested with --test 8.
 Test 9 (keep-alive timeout) waits 30+ seconds and must be requested with --test 9.
@@ -67,6 +68,21 @@ ERR_IFACE_ATTACH_FAILED     = 0x0012
 IFACE_STATE_AVAILABLE       = 0x01
 IFACE_STATE_ATTACHED_THIS   = 0x02
 IFACE_STATE_ATTACHED_OTHER  = 0x03
+
+# Definition management (SPEC §6)
+MSG_DEF_SIGNAL  = 0x0020
+MSG_DEF_PDU     = 0x0021
+MSG_DEF_FRAME   = 0x0022
+MSG_DEF_DELETE  = 0x0023
+MSG_DEF_ACK     = 0x8020
+
+ERR_DEF_INVALID   = 0x0020
+ERR_DEF_CONFLICT  = 0x0021
+ERR_DEF_IN_USE    = 0x0022
+
+DEF_TYPE_SIGNAL = 0x01
+DEF_TYPE_PDU    = 0x02
+DEF_TYPE_FRAME  = 0x03
 
 KEEPALIVE_TIMEOUT_SEC    = 30
 
@@ -146,6 +162,11 @@ MSG_NAMES = {
     0x8011: 'IFACE_ATTACH_ACK',
     0x8012: 'IFACE_DETACH_ACK',
     0x8013: 'IFACE_VCAN_ACK',
+    0x0020: 'DEF_SIGNAL',
+    0x0021: 'DEF_PDU',
+    0x0022: 'DEF_FRAME',
+    0x0023: 'DEF_DELETE',
+    0x8020: 'DEF_ACK',
     0xFFFF: 'MSG_ERR',
 }
 
@@ -159,6 +180,9 @@ ERR_NAMES = {
     0x0010: 'ERR_IFACE_NOT_FOUND',
     0x0011: 'ERR_IFACE_ALREADY_ATTACHED',
     0x0012: 'ERR_IFACE_ATTACH_FAILED',
+    0x0020: 'ERR_DEF_INVALID',
+    0x0021: 'ERR_DEF_CONFLICT',
+    0x0022: 'ERR_DEF_IN_USE',
 }
 
 def fmt_type(t):
@@ -822,6 +846,345 @@ def test_notify_iface_down(host, port):
         print('  [skipped]')
 
 
+# ── Definition management helpers ────────────────────────────────────────────
+
+def make_def_signal(name, data_type=0x01, byte_order=0x01, bit_length=8,
+                    scale=1.0, offset=0.0, min_val=0.0, max_val=255.0):
+    """Build a DEF_SIGNAL frame (SPEC §6.1).
+
+    data_type:  0x01=uint, 0x02=sint, 0x03=float
+    byte_order: 0x01=little-endian, 0x02=big-endian
+    """
+    n = name.encode()
+    payload = bytes([len(n)]) + n
+    payload += bytes([data_type, byte_order, bit_length])
+    payload += struct.pack('>dddd', scale, offset, min_val, max_val)
+    return make_frame(PROTO_VERSION, MSG_DEF_SIGNAL, payload)
+
+
+def make_def_pdu(name, pdu_length, signal_mappings):
+    """Build a DEF_PDU frame (SPEC §6.2).
+
+    signal_mappings: list of (signal_name, start_bit) tuples
+    """
+    n = name.encode()
+    payload = bytes([len(n)]) + n + bytes([pdu_length, len(signal_mappings)])
+    for sig_name, start_bit in signal_mappings:
+        sn = sig_name.encode()
+        payload += bytes([len(sn)]) + sn + bytes([start_bit])
+    return make_frame(PROTO_VERSION, MSG_DEF_PDU, payload)
+
+
+def make_def_frame(name, can_id, id_type, dlc, tx_period, pdu_mappings):
+    """Build a DEF_FRAME frame (SPEC §6.3).
+
+    id_type:     0x01=standard (11-bit), 0x02=extended (29-bit)
+    tx_period:   ms; 0 = event-driven
+    pdu_mappings: list of (pdu_name, byte_offset) tuples
+    """
+    n = name.encode()
+    payload = bytes([len(n)]) + n
+    payload += struct.pack('>I', can_id)
+    payload += bytes([id_type, dlc])
+    payload += struct.pack('>H', tx_period)
+    payload += bytes([len(pdu_mappings)])
+    for pdu_name, byte_offset in pdu_mappings:
+        pn = pdu_name.encode()
+        payload += bytes([len(pn)]) + pn + bytes([byte_offset])
+    return make_frame(PROTO_VERSION, MSG_DEF_FRAME, payload)
+
+
+def make_def_delete(name, def_type):
+    """Build a DEF_DELETE frame (SPEC §6.4).
+
+    def_type: DEF_TYPE_SIGNAL, DEF_TYPE_PDU, or DEF_TYPE_FRAME
+    """
+    n = name.encode()
+    payload = bytes([len(n)]) + n + bytes([def_type])
+    return make_frame(PROTO_VERSION, MSG_DEF_DELETE, payload)
+
+
+def def_cleanup(s, *name_type_pairs):
+    """Best-effort DEF_DELETE for each (name, def_type) pair (reverse order)."""
+    for name, def_type in reversed(name_type_pairs):
+        s.sendall(make_def_delete(name, def_type))
+        recv_frame(s)
+
+
+# ── Definition store tests (SPEC §6) ─────────────────────────────────────────
+
+def test_def_signal(host, port):
+    """Test 18 — DEF_SIGNAL: define a signal → DEF_ACK."""
+    print('\n[18] DEF_SIGNAL — expect DEF_ACK')
+    with open_session(host, port, 'def-sig-test')[0] as s:
+        s.sendall(make_def_signal('t18_sig'))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            return
+        _, msg_type, _ = frame
+        check(msg_type == MSG_DEF_ACK,
+              f'response is DEF_ACK (got {fmt_type(msg_type)})')
+        def_cleanup(s, ('t18_sig', DEF_TYPE_SIGNAL))
+
+
+def test_def_pdu(host, port):
+    """Test 19 — DEF_PDU: define signal then PDU referencing it → DEF_ACK."""
+    print('\n[19] DEF_PDU — define signal then PDU referencing it, expect DEF_ACK')
+    with open_session(host, port, 'def-pdu-test')[0] as s:
+        # Prerequisite: define the signal
+        s.sendall(make_def_signal('t19_sig'))
+        if recv_frame(s) is None:
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+
+        s.sendall(make_def_pdu('t19_pdu', 8, [('t19_sig', 0)]))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            def_cleanup(s, ('t19_sig', DEF_TYPE_SIGNAL))
+            return
+        _, msg_type, _ = frame
+        check(msg_type == MSG_DEF_ACK,
+              f'response is DEF_ACK (got {fmt_type(msg_type)})')
+        def_cleanup(s, ('t19_sig', DEF_TYPE_SIGNAL), ('t19_pdu', DEF_TYPE_PDU))
+
+
+def test_def_frame(host, port):
+    """Test 20 — DEF_FRAME: full define chain signal → PDU → frame → DEF_ACK."""
+    print('\n[20] DEF_FRAME — full define chain, expect DEF_ACK for each')
+    with open_session(host, port, 'def-frame-test')[0] as s:
+        s.sendall(make_def_signal('t20_sig'))
+        if recv_frame(s) is None:
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+
+        s.sendall(make_def_pdu('t20_pdu', 8, [('t20_sig', 0)]))
+        if recv_frame(s) is None:
+            check(False, 'DEF_PDU prerequisite failed')
+            def_cleanup(s, ('t20_sig', DEF_TYPE_SIGNAL))
+            return
+
+        s.sendall(make_def_frame('t20_frame', 0x123, 0x01, 8, 0,
+                                 [('t20_pdu', 0)]))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            def_cleanup(s, ('t20_sig', DEF_TYPE_SIGNAL), ('t20_pdu', DEF_TYPE_PDU))
+            return
+        _, msg_type, _ = frame
+        check(msg_type == MSG_DEF_ACK,
+              f'response is DEF_ACK (got {fmt_type(msg_type)})')
+        def_cleanup(s,
+                    ('t20_sig', DEF_TYPE_SIGNAL),
+                    ('t20_pdu', DEF_TYPE_PDU),
+                    ('t20_frame', DEF_TYPE_FRAME))
+
+
+def test_def_pdu_unknown_signal(host, port):
+    """Test 21 — DEF_PDU with an undefined signal reference → ERR_DEF_INVALID."""
+    print('\n[21] DEF_PDU with unknown signal — expect ERR_DEF_INVALID')
+    with open_session(host, port, 'def-pdu-badsig')[0] as s:
+        s.sendall(make_def_pdu('t21_pdu', 8, [('no_such_signal', 0)]))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            return
+        _, msg_type, payload = frame
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload)
+        check(code == ERR_DEF_INVALID,
+              f'err_code is ERR_DEF_INVALID (got {fmt_err(code)})')
+
+
+def test_def_frame_unknown_pdu(host, port):
+    """Test 22 — DEF_FRAME with an undefined PDU reference → ERR_DEF_INVALID."""
+    print('\n[22] DEF_FRAME with unknown PDU — expect ERR_DEF_INVALID')
+    with open_session(host, port, 'def-frame-badpdu')[0] as s:
+        s.sendall(make_def_frame('t22_frame', 0x456, 0x01, 8, 0,
+                                 [('no_such_pdu', 0)]))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            return
+        _, msg_type, payload = frame
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload)
+        check(code == ERR_DEF_INVALID,
+              f'err_code is ERR_DEF_INVALID (got {fmt_err(code)})')
+
+
+def test_def_type_conflict(host, port):
+    """Test 23 — Reusing a signal name as a PDU name → ERR_DEF_CONFLICT."""
+    print('\n[23] Type conflict: define signal, reuse name as PDU — expect ERR_DEF_CONFLICT')
+    with open_session(host, port, 'def-conflict-test')[0] as s:
+        s.sendall(make_def_signal('t23_name'))
+        if recv_frame(s) is None:
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+
+        # Attempt to define a PDU with the same name
+        s.sendall(make_def_pdu('t23_name', 8, []))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            def_cleanup(s, ('t23_name', DEF_TYPE_SIGNAL))
+            return
+        _, msg_type, payload = frame
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload)
+        check(code == ERR_DEF_CONFLICT,
+              f'err_code is ERR_DEF_CONFLICT (got {fmt_err(code)})')
+        def_cleanup(s, ('t23_name', DEF_TYPE_SIGNAL))
+
+
+def test_def_delete_signal_in_use(host, port):
+    """Test 24 — Delete a signal referenced by a PDU → ERR_DEF_IN_USE."""
+    print('\n[24] DEF_DELETE signal in use by PDU — expect ERR_DEF_IN_USE')
+    with open_session(host, port, 'def-del-sig-inuse')[0] as s:
+        s.sendall(make_def_signal('t24_sig'))
+        if recv_frame(s) is None:
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+        s.sendall(make_def_pdu('t24_pdu', 8, [('t24_sig', 0)]))
+        if recv_frame(s) is None:
+            check(False, 'DEF_PDU prerequisite failed')
+            def_cleanup(s, ('t24_sig', DEF_TYPE_SIGNAL))
+            return
+
+        s.sendall(make_def_delete('t24_sig', DEF_TYPE_SIGNAL))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            def_cleanup(s, ('t24_sig', DEF_TYPE_SIGNAL), ('t24_pdu', DEF_TYPE_PDU))
+            return
+        _, msg_type, payload = frame
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload)
+        check(code == ERR_DEF_IN_USE,
+              f'err_code is ERR_DEF_IN_USE (got {fmt_err(code)})')
+        def_cleanup(s, ('t24_sig', DEF_TYPE_SIGNAL), ('t24_pdu', DEF_TYPE_PDU))
+
+
+def test_def_delete_pdu_in_use(host, port):
+    """Test 25 — Delete a PDU referenced by a frame → ERR_DEF_IN_USE."""
+    print('\n[25] DEF_DELETE PDU in use by frame — expect ERR_DEF_IN_USE')
+    with open_session(host, port, 'def-del-pdu-inuse')[0] as s:
+        s.sendall(make_def_signal('t25_sig'))
+        if recv_frame(s) is None:
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+        s.sendall(make_def_pdu('t25_pdu', 8, [('t25_sig', 0)]))
+        if recv_frame(s) is None:
+            check(False, 'DEF_PDU prerequisite failed')
+            def_cleanup(s, ('t25_sig', DEF_TYPE_SIGNAL))
+            return
+        s.sendall(make_def_frame('t25_frame', 0x789, 0x01, 8, 0,
+                                 [('t25_pdu', 0)]))
+        if recv_frame(s) is None:
+            check(False, 'DEF_FRAME prerequisite failed')
+            def_cleanup(s, ('t25_sig', DEF_TYPE_SIGNAL), ('t25_pdu', DEF_TYPE_PDU))
+            return
+
+        s.sendall(make_def_delete('t25_pdu', DEF_TYPE_PDU))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            def_cleanup(s, ('t25_sig', DEF_TYPE_SIGNAL), ('t25_pdu', DEF_TYPE_PDU),
+                        ('t25_frame', DEF_TYPE_FRAME))
+            return
+        _, msg_type, payload = frame
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload)
+        check(code == ERR_DEF_IN_USE,
+              f'err_code is ERR_DEF_IN_USE (got {fmt_err(code)})')
+        def_cleanup(s, ('t25_sig', DEF_TYPE_SIGNAL), ('t25_pdu', DEF_TYPE_PDU),
+                    ('t25_frame', DEF_TYPE_FRAME))
+
+
+def test_def_pdu_signal_count_limit(host, port):
+    """Test 26 — DEF_PDU with signal_count > 32 → ERR_DEF_INVALID."""
+    print('\n[26] DEF_PDU signal_count=33 (> 32 limit) — expect ERR_DEF_INVALID')
+    with open_session(host, port, 'def-pdu-siglimit')[0] as s:
+        # Build a PDU payload with signal_count=33 but no actual mappings.
+        # The server validates the count before parsing mappings.
+        n = b't26_pdu'
+        payload = bytes([len(n)]) + n + bytes([8, 33])  # pdu_length=8, signal_count=33
+        s.sendall(make_frame(PROTO_VERSION, MSG_DEF_PDU, payload))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            return
+        _, msg_type, payload_resp = frame
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload_resp)
+        check(code == ERR_DEF_INVALID,
+              f'err_code is ERR_DEF_INVALID (got {fmt_err(code)})')
+
+
+def test_def_frame_pdu_count_limit(host, port):
+    """Test 27 — DEF_FRAME with pdu_count > 8 → ERR_DEF_INVALID."""
+    print('\n[27] DEF_FRAME pdu_count=9 (> 8 limit) — expect ERR_DEF_INVALID')
+    with open_session(host, port, 'def-frame-pdulimit')[0] as s:
+        # Build a FRAME payload with pdu_count=9 but no actual mappings.
+        n = b't27_frame'
+        payload  = bytes([len(n)]) + n
+        payload += struct.pack('>I', 0x100)   # can_id
+        payload += bytes([0x01, 8])            # id_type=standard, dlc=8
+        payload += struct.pack('>H', 0)        # tx_period=0
+        payload += bytes([9])                  # pdu_count=9 (over limit)
+        s.sendall(make_frame(PROTO_VERSION, MSG_DEF_FRAME, payload))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            return
+        _, msg_type, payload_resp = frame
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload_resp)
+        check(code == ERR_DEF_INVALID,
+              f'err_code is ERR_DEF_INVALID (got {fmt_err(code)})')
+
+
+def test_def_persistence(host, port):
+    """Test 28 — Definitions persist after session disconnect."""
+    print('\n[28] Definition persistence — signal defined in session 1 visible to session 2')
+    # Session 1: define signal
+    s1, _ = open_session(host, port, 'def-persist-s1')
+    if s1 is None:
+        check(False, 'could not establish session 1 (prerequisite failed)')
+        return
+
+    try:
+        s1.sendall(make_def_signal('t28_sig'))
+        if recv_frame(s1) is None:
+            check(False, 'DEF_SIGNAL in session 1 failed')
+            return
+        s1.sendall(make_frame(PROTO_VERSION, MSG_SESSION_CLOSE))
+        recv_frame(s1)
+    finally:
+        s1.close()
+
+    # Session 2: define a PDU referencing the signal from session 1 — must succeed
+    with open_session(host, port, 'def-persist-s2')[0] as s2:
+        s2.sendall(make_def_pdu('t28_pdu', 8, [('t28_sig', 0)]))
+        frame = recv_frame(s2)
+        print_response(frame)
+        if not check(frame is not None, 'received a response in session 2'):
+            def_cleanup(s2, ('t28_sig', DEF_TYPE_SIGNAL))
+            return
+        _, msg_type, _ = frame
+        check(msg_type == MSG_DEF_ACK,
+              f'DEF_PDU referencing persisted signal succeeds (got {fmt_type(msg_type)})')
+        def_cleanup(s2, ('t28_sig', DEF_TYPE_SIGNAL), ('t28_pdu', DEF_TYPE_PDU))
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 TESTS = [
@@ -842,9 +1205,20 @@ TESTS = [
     test_session_close_releases_iface,  # 15
     test_iface_vcan_destroy,            # 16
     test_notify_iface_down,             # 17 — interactive
+    test_def_signal,                    # 18
+    test_def_pdu,                       # 19
+    test_def_frame,                     # 20
+    test_def_pdu_unknown_signal,        # 21
+    test_def_frame_unknown_pdu,         # 22
+    test_def_type_conflict,             # 23
+    test_def_delete_signal_in_use,      # 24
+    test_def_delete_pdu_in_use,         # 25
+    test_def_pdu_signal_count_limit,    # 26
+    test_def_frame_pdu_count_limit,     # 27
+    test_def_persistence,               # 28
 ]
 
-AUTO_TESTS = TESTS[:7] + TESTS[9:16]   # 1-7 and 10-16 run unattended
+AUTO_TESTS = TESTS[:7] + TESTS[9:16] + TESTS[17:]  # 1-7, 10-16, and 18-28 run unattended
 
 
 def main():
@@ -874,6 +1248,7 @@ def main():
         print('\n[8]  Graceful shutdown    — run with --test 8')
         print('[9]  Keep-alive timeout  — run with --test 9 (takes 35 s)')
         print('[17] NOTIFY_IFACE_DOWN   — run with --test 17 (requires manual ip link delete)')
+        print('     (Tests 18-28 run automatically above)')
 
     print()
 
