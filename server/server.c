@@ -3,6 +3,7 @@
 #include "session.h"
 #include "iface.h"
 #include "def.h"
+#include "own.h"
 
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
@@ -196,6 +197,10 @@ int server_init(server_t *s, uint16_t port, const char *storage_dir)
     def_init();
     def_register_handlers();
 
+    /* --- Ownership module --- */
+    own_init(s);
+    own_register_handlers();
+
     printf("ash-server listening on port %u\n", (unsigned)port);
     return 0;
 }
@@ -358,6 +363,7 @@ void server_destroy(server_t *s)
         s->sessions[i].fd = -1;
     }
 
+    own_destroy();
     def_destroy();
     iface_destroy();
 

@@ -580,6 +580,11 @@ static int handle_def_delete(int fd, const proto_frame_t *frame)
  * Module lifecycle
  * ---------------------------------------------------------------------- */
 
+int def_signal_exists(const char *name)
+{
+    return signal_find(name) != NULL;
+}
+
 void def_init(void)
 {
     g_signal_count = 0;

@@ -13,4 +13,7 @@ void def_init(void);
 void def_destroy(void);
 void def_register_handlers(void);
 
+/* Returns 1 if a signal with the given name is defined, 0 otherwise. */
+int def_signal_exists(const char *name);
+
 #endif /* ASH_SERVER_DEF_H */

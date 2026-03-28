@@ -11,6 +11,7 @@ Tests 1-7 run automatically.
 Tests 10-16 (CAN interface management) run automatically; the server must have
 CAP_NET_ADMIN (root) to create/destroy vcan interfaces.
 Tests 18-28 (definition store) run automatically.
+Tests 29-36 (signal ownership) run automatically.
 Test 8 (graceful server shutdown) requires manually stopping the server and
 must be requested with --test 8.
 Test 9 (keep-alive timeout) waits 30+ seconds and must be requested with --test 9.
@@ -167,6 +168,12 @@ MSG_NAMES = {
     0x0022: 'DEF_FRAME',
     0x0023: 'DEF_DELETE',
     0x8020: 'DEF_ACK',
+    0x0030: 'OWN_ACQUIRE',
+    0x0031: 'OWN_RELEASE',
+    0x0032: 'OWN_LOCK',
+    0x0033: 'OWN_UNLOCK',
+    0x8030: 'OWN_ACK',
+    0x9001: 'NOTIFY_OWN_REVOKED',
     0xFFFF: 'MSG_ERR',
 }
 
@@ -183,6 +190,8 @@ ERR_NAMES = {
     0x0020: 'ERR_DEF_INVALID',
     0x0021: 'ERR_DEF_CONFLICT',
     0x0022: 'ERR_DEF_IN_USE',
+    0x0030: 'ERR_OWN_NOT_AVAILABLE',
+    0x0031: 'ERR_OWN_NOT_HELD',
 }
 
 def fmt_type(t):
@@ -1185,6 +1194,330 @@ def test_def_persistence(host, port):
         def_cleanup(s2, ('t28_sig', DEF_TYPE_SIGNAL), ('t28_pdu', DEF_TYPE_PDU))
 
 
+# ── Ownership helpers ─────────────────────────────────────────────────────────
+
+MSG_OWN_ACQUIRE       = 0x0030
+MSG_OWN_RELEASE       = 0x0031
+MSG_OWN_LOCK          = 0x0032
+MSG_OWN_UNLOCK        = 0x0033
+MSG_OWN_ACK           = 0x8030
+MSG_NOTIFY_OWN_REVOKED = 0x9001
+
+ERR_OWN_NOT_AVAILABLE = 0x0030
+ERR_OWN_NOT_HELD      = 0x0031
+
+OWN_ON_DISC_STOP    = 0x01
+OWN_ON_DISC_LAST    = 0x02
+OWN_ON_DISC_DEFAULT = 0x03
+
+
+def make_own_acquire(sig_name, on_disconnect=OWN_ON_DISC_STOP):
+    n = sig_name.encode()
+    payload = bytes([len(n)]) + n + bytes([on_disconnect])
+    return make_frame(PROTO_VERSION, MSG_OWN_ACQUIRE, payload)
+
+
+def make_own_release(sig_name):
+    n = sig_name.encode()
+    payload = bytes([len(n)]) + n
+    return make_frame(PROTO_VERSION, MSG_OWN_RELEASE, payload)
+
+
+def make_own_lock(sig_name):
+    n = sig_name.encode()
+    payload = bytes([len(n)]) + n
+    return make_frame(PROTO_VERSION, MSG_OWN_LOCK, payload)
+
+
+def make_own_unlock(sig_name):
+    n = sig_name.encode()
+    payload = bytes([len(n)]) + n
+    return make_frame(PROTO_VERSION, MSG_OWN_UNLOCK, payload)
+
+
+def _define_signal(s, sig_name):
+    """Helper: define a signal and return True on success."""
+    s.sendall(make_def_signal(sig_name))
+    f = recv_frame(s)
+    return f is not None and f[1] == MSG_DEF_ACK
+
+
+def _delete_signal(s, sig_name):
+    """Helper: best-effort DEF_DELETE for a signal."""
+    s.sendall(make_def_delete(sig_name, DEF_TYPE_SIGNAL))
+    recv_frame(s)
+
+
+# ── Ownership tests (SPEC §8) ─────────────────────────────────────────────────
+
+def test_own_acquire(host, port):
+    """Test 29 — OWN_ACQUIRE on a defined signal → OWN_ACK."""
+    print('\n[29] OWN_ACQUIRE — define signal, acquire ownership, expect OWN_ACK')
+    with open_session(host, port, 'own-acquire-test')[0] as s:
+        if not _define_signal(s, 't29_sig'):
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+        s.sendall(make_own_acquire('t29_sig'))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            _delete_signal(s, 't29_sig')
+            return
+        _, msg_type, _ = frame
+        check(msg_type == MSG_OWN_ACK,
+              f'response is OWN_ACK (got {fmt_type(msg_type)})')
+        s.sendall(make_own_release('t29_sig'))
+        recv_frame(s)
+        _delete_signal(s, 't29_sig')
+
+
+def test_own_release(host, port):
+    """Test 30 — OWN_RELEASE by owning session → OWN_ACK."""
+    print('\n[30] OWN_RELEASE — acquire then release, expect OWN_ACK')
+    with open_session(host, port, 'own-release-test')[0] as s:
+        if not _define_signal(s, 't30_sig'):
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+        s.sendall(make_own_acquire('t30_sig'))
+        if recv_frame(s) is None:
+            check(False, 'OWN_ACQUIRE prerequisite failed')
+            _delete_signal(s, 't30_sig')
+            return
+        s.sendall(make_own_release('t30_sig'))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            _delete_signal(s, 't30_sig')
+            return
+        _, msg_type, _ = frame
+        check(msg_type == MSG_OWN_ACK,
+              f'response is OWN_ACK (got {fmt_type(msg_type)})')
+        _delete_signal(s, 't30_sig')
+
+
+def test_own_release_not_held(host, port):
+    """Test 31 — OWN_RELEASE without ownership → ERR_OWN_NOT_HELD."""
+    print('\n[31] OWN_RELEASE without ownership — expect ERR_OWN_NOT_HELD')
+    with open_session(host, port, 'own-release-notheld')[0] as s:
+        if not _define_signal(s, 't31_sig'):
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+        s.sendall(make_own_release('t31_sig'))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            _delete_signal(s, 't31_sig')
+            return
+        _, msg_type, payload = frame
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload)
+        check(code == ERR_OWN_NOT_HELD,
+              f'err_code is ERR_OWN_NOT_HELD (got {fmt_err(code)})')
+        _delete_signal(s, 't31_sig')
+
+
+def test_own_transfer(host, port):
+    """Test 32 — Ownership transfer: session 2 acquires unlocked signal owned by session 1;
+    session 1 receives NOTIFY_OWN_REVOKED."""
+    print('\n[32] Ownership transfer — session 2 acquires session 1\'s unlocked signal;'
+          ' session 1 gets NOTIFY_OWN_REVOKED')
+    s1, _ = open_session(host, port, 'own-transfer-s1')
+    if s1 is None:
+        check(False, 'could not establish session 1')
+        return
+
+    try:
+        if not _define_signal(s1, 't32_sig'):
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+        s1.sendall(make_own_acquire('t32_sig'))
+        if recv_frame(s1) is None:
+            check(False, 'OWN_ACQUIRE prerequisite failed')
+            _delete_signal(s1, 't32_sig')
+            return
+
+        with open_session(host, port, 'own-transfer-s2')[0] as s2:
+            s2.sendall(make_own_acquire('t32_sig'))
+            ack = recv_frame(s2)
+            print_response(ack)
+            if not check(ack is not None, 'session 2 received a response to OWN_ACQUIRE'):
+                return
+            _, msg_type, _ = ack
+            check(msg_type == MSG_OWN_ACK,
+                  f'session 2 OWN_ACQUIRE succeeds (got {fmt_type(msg_type)})')
+
+            # Session 1 should receive NOTIFY_OWN_REVOKED
+            s1.settimeout(2)
+            try:
+                notif = recv_frame(s1)
+                print_response(notif)
+                if not check(notif is not None, 'session 1 received NOTIFY_OWN_REVOKED'):
+                    return
+                _, ntype, npayload = notif
+                check(ntype == MSG_NOTIFY_OWN_REVOKED,
+                      f'notification is NOTIFY_OWN_REVOKED (got {fmt_type(ntype)})')
+                if npayload:
+                    nlen = npayload[0]
+                    nname = npayload[1:1 + nlen].decode(errors='replace')
+                    check(nname == 't32_sig',
+                          f'notification names t32_sig (got {nname!r})')
+            except OSError:
+                check(False, 'session 1 timed out waiting for NOTIFY_OWN_REVOKED')
+
+            s2.sendall(make_own_release('t32_sig'))
+            recv_frame(s2)
+
+    finally:
+        _delete_signal(s1, 't32_sig')
+        s1.close()
+
+
+def test_own_locked_not_available(host, port):
+    """Test 33 — Locked signal cannot be acquired by another session → ERR_OWN_NOT_AVAILABLE."""
+    print('\n[33] OWN_ACQUIRE on locked signal — expect ERR_OWN_NOT_AVAILABLE')
+    s1, _ = open_session(host, port, 'own-lock-s1')
+    if s1 is None:
+        check(False, 'could not establish session 1')
+        return
+
+    try:
+        if not _define_signal(s1, 't33_sig'):
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+        s1.sendall(make_own_acquire('t33_sig'))
+        if recv_frame(s1) is None:
+            check(False, 'OWN_ACQUIRE prerequisite failed')
+            _delete_signal(s1, 't33_sig')
+            return
+        s1.sendall(make_own_lock('t33_sig'))
+        if recv_frame(s1) is None:
+            check(False, 'OWN_LOCK prerequisite failed')
+            _delete_signal(s1, 't33_sig')
+            return
+
+        with open_session(host, port, 'own-lock-s2')[0] as s2:
+            s2.sendall(make_own_acquire('t33_sig'))
+            frame = recv_frame(s2)
+            print_response(frame)
+            if not check(frame is not None, 'session 2 received a response'):
+                return
+            _, msg_type, payload = frame
+            check(msg_type == MSG_ERR,
+                  f'response is MSG_ERR (got {fmt_type(msg_type)})')
+            code, _ = decode_err(payload)
+            check(code == ERR_OWN_NOT_AVAILABLE,
+                  f'err_code is ERR_OWN_NOT_AVAILABLE (got {fmt_err(code)})')
+
+        # Cleanup: unlock and release before deleting
+        s1.sendall(make_own_unlock('t33_sig'))
+        recv_frame(s1)
+        s1.sendall(make_own_release('t33_sig'))
+        recv_frame(s1)
+        _delete_signal(s1, 't33_sig')
+
+    finally:
+        s1.close()
+
+
+def test_own_lock_unlock(host, port):
+    """Test 34 — OWN_LOCK / OWN_UNLOCK by owner → OWN_ACK each."""
+    print('\n[34] OWN_LOCK / OWN_UNLOCK by owner — expect OWN_ACK each')
+    with open_session(host, port, 'own-lock-unlock')[0] as s:
+        if not _define_signal(s, 't34_sig'):
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+        s.sendall(make_own_acquire('t34_sig'))
+        if recv_frame(s) is None:
+            check(False, 'OWN_ACQUIRE prerequisite failed')
+            _delete_signal(s, 't34_sig')
+            return
+
+        s.sendall(make_own_lock('t34_sig'))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received response to OWN_LOCK'):
+            _delete_signal(s, 't34_sig')
+            return
+        _, msg_type, _ = frame
+        check(msg_type == MSG_OWN_ACK,
+              f'OWN_LOCK → OWN_ACK (got {fmt_type(msg_type)})')
+
+        s.sendall(make_own_unlock('t34_sig'))
+        frame2 = recv_frame(s)
+        print_response(frame2)
+        if not check(frame2 is not None, 'received response to OWN_UNLOCK'):
+            _delete_signal(s, 't34_sig')
+            return
+        _, msg_type2, _ = frame2
+        check(msg_type2 == MSG_OWN_ACK,
+              f'OWN_UNLOCK → OWN_ACK (got {fmt_type(msg_type2)})')
+
+        s.sendall(make_own_release('t34_sig'))
+        recv_frame(s)
+        _delete_signal(s, 't34_sig')
+
+
+def test_own_lock_not_held(host, port):
+    """Test 35 — OWN_LOCK without ownership → ERR_OWN_NOT_HELD."""
+    print('\n[35] OWN_LOCK without ownership — expect ERR_OWN_NOT_HELD')
+    with open_session(host, port, 'own-lock-notheld')[0] as s:
+        if not _define_signal(s, 't35_sig'):
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+        s.sendall(make_own_lock('t35_sig'))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            _delete_signal(s, 't35_sig')
+            return
+        _, msg_type, payload = frame
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload)
+        check(code == ERR_OWN_NOT_HELD,
+              f'err_code is ERR_OWN_NOT_HELD (got {fmt_err(code)})')
+        _delete_signal(s, 't35_sig')
+
+
+def test_own_session_close_releases(host, port):
+    """Test 36 — Session close releases ownership; another session can acquire."""
+    print('\n[36] Session close releases ownership — second session can acquire after first closes')
+    s1, _ = open_session(host, port, 'own-close-s1')
+    if s1 is None:
+        check(False, 'could not establish session 1')
+        return
+
+    try:
+        if not _define_signal(s1, 't36_sig'):
+            check(False, 'DEF_SIGNAL prerequisite failed')
+            return
+        s1.sendall(make_own_acquire('t36_sig'))
+        if recv_frame(s1) is None:
+            check(False, 'OWN_ACQUIRE prerequisite failed')
+            _delete_signal(s1, 't36_sig')
+            return
+        s1.sendall(make_frame(PROTO_VERSION, MSG_SESSION_CLOSE))
+        recv_frame(s1)
+    finally:
+        s1.close()
+
+    # New session: ownership now available
+    with open_session(host, port, 'own-close-s2')[0] as s2:
+        s2.sendall(make_own_acquire('t36_sig'))
+        frame = recv_frame(s2)
+        print_response(frame)
+        if not check(frame is not None, 'session 2 received a response'):
+            _delete_signal(s2, 't36_sig')
+            return
+        _, msg_type, _ = frame
+        check(msg_type == MSG_OWN_ACK,
+              f'ownership available after session close (got {fmt_type(msg_type)})')
+        s2.sendall(make_own_release('t36_sig'))
+        recv_frame(s2)
+        _delete_signal(s2, 't36_sig')
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 TESTS = [
@@ -1216,9 +1549,17 @@ TESTS = [
     test_def_pdu_signal_count_limit,    # 26
     test_def_frame_pdu_count_limit,     # 27
     test_def_persistence,               # 28
+    test_own_acquire,                   # 29
+    test_own_release,                   # 30
+    test_own_release_not_held,          # 31
+    test_own_transfer,                  # 32
+    test_own_locked_not_available,      # 33
+    test_own_lock_unlock,               # 34
+    test_own_lock_not_held,             # 35
+    test_own_session_close_releases,    # 36
 ]
 
-AUTO_TESTS = TESTS[:7] + TESTS[9:16] + TESTS[17:]  # 1-7, 10-16, and 18-28 run unattended
+AUTO_TESTS = TESTS[:7] + TESTS[9:16] + TESTS[17:]  # 1-7, 10-16, and 18-36 run unattended
 
 
 def main():
