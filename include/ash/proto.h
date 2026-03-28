@@ -95,6 +95,7 @@ typedef struct {
 #define ERR_IFACE_NOT_FOUND         0x0010u
 #define ERR_IFACE_ALREADY_ATTACHED  0x0011u
 #define ERR_IFACE_ATTACH_FAILED     0x0012u
+#define ERR_PERMISSION_DENIED       0x0013u
 #define ERR_DEF_INVALID             0x0020u
 #define ERR_DEF_CONFLICT            0x0021u
 #define ERR_DEF_IN_USE              0x0022u

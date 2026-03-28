@@ -20,9 +20,10 @@ typedef struct {
     int         epoll_fd;
     int         listen_fd;
     int         signal_fd;
-    int         netlink_fd;   /* RTMGRP_LINK monitoring socket (-1 if unused) */
+    int         netlink_fd;        /* RTMGRP_LINK monitoring socket (-1 if unused) */
     const char *storage_dir;
     uint16_t    port;
+    uint8_t     has_cap_net_admin; /* 1 if server holds CAP_NET_ADMIN */
     session_t   sessions[MAX_SESSIONS];
     int         nsessions;
 } server_t;

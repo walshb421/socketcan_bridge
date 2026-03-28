@@ -12,6 +12,8 @@ Tests 10-16 (CAN interface management) run automatically; the server must have
 CAP_NET_ADMIN (root) to create/destroy vcan interfaces.
 Tests 18-28 (definition store) run automatically.
 Tests 29-36 (signal ownership) run automatically.
+Tests 37-39 (CAP_NET_ADMIN) run automatically; they self-skip when the server
+holds CAP_NET_ADMIN.
 Test 8 (graceful server shutdown) requires manually stopping the server and
 must be requested with --test 8.
 Test 9 (keep-alive timeout) waits 30+ seconds and must be requested with --test 9.
@@ -187,6 +189,7 @@ ERR_NAMES = {
     0x0010: 'ERR_IFACE_NOT_FOUND',
     0x0011: 'ERR_IFACE_ALREADY_ATTACHED',
     0x0012: 'ERR_IFACE_ATTACH_FAILED',
+    0x0013: 'ERR_PERMISSION_DENIED',
     0x0020: 'ERR_DEF_INVALID',
     0x0021: 'ERR_DEF_CONFLICT',
     0x0022: 'ERR_DEF_IN_USE',
@@ -1518,6 +1521,108 @@ def test_own_session_close_releases(host, port):
         _delete_signal(s2, 't36_sig')
 
 
+# ── CAP_NET_ADMIN tests ───────────────────────────────────────────────────────
+
+ERR_PERMISSION_DENIED = 0x0013
+
+
+def test_cap_net_admin_vcan_create(host, port):
+    """Test 37 — IFACE_VCAN_CREATE without CAP_NET_ADMIN → ERR_PERMISSION_DENIED.
+
+    Skipped automatically when the server holds CAP_NET_ADMIN (operation
+    succeeds instead and is cleaned up).
+    """
+    print('\n[37] IFACE_VCAN_CREATE without CAP_NET_ADMIN — expect ERR_PERMISSION_DENIED'
+          ' (skipped if server has CAP_NET_ADMIN)')
+    with open_session(host, port, 'cap-vcan-create')[0] as s:
+        s.sendall(make_iface_vcan_create(TEST_VCAN))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            return
+        _, msg_type, payload = frame
+        if msg_type == MSG_IFACE_VCAN_ACK:
+            print('  [skip] server holds CAP_NET_ADMIN')
+            s.sendall(make_iface_vcan_destroy(TEST_VCAN))
+            recv_frame(s)
+            return
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload)
+        check(code == ERR_PERMISSION_DENIED,
+              f'err_code is ERR_PERMISSION_DENIED (got {fmt_err(code)})')
+
+
+def test_cap_net_admin_vcan_destroy(host, port):
+    """Test 38 — IFACE_VCAN_DESTROY without CAP_NET_ADMIN → ERR_PERMISSION_DENIED.
+
+    Skipped automatically when the server holds CAP_NET_ADMIN.
+    """
+    print('\n[38] IFACE_VCAN_DESTROY without CAP_NET_ADMIN — expect ERR_PERMISSION_DENIED'
+          ' (skipped if server has CAP_NET_ADMIN)')
+    with open_session(host, port, 'cap-vcan-destroy')[0] as s:
+        s.sendall(make_iface_vcan_destroy(TEST_VCAN))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            return
+        _, msg_type, payload = frame
+        if msg_type == MSG_IFACE_VCAN_ACK:
+            print('  [skip] server holds CAP_NET_ADMIN')
+            return
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload)
+        check(code == ERR_PERMISSION_DENIED,
+              f'err_code is ERR_PERMISSION_DENIED (got {fmt_err(code)})')
+
+
+def test_cap_net_admin_attach_bitrate(host, port):
+    """Test 39 — IFACE_ATTACH with non-zero bitrate without CAP_NET_ADMIN →
+    ERR_PERMISSION_DENIED.
+
+    Uses IFACE_VCAN_CREATE as a capability probe: if it succeeds the server
+    holds CAP_NET_ADMIN and the test is skipped.  If the server lacks the
+    capability, attempts IFACE_ATTACH with bitrate=500000 on any listed
+    interface and expects ERR_PERMISSION_DENIED.
+    """
+    print('\n[39] IFACE_ATTACH with bitrate≠0 without CAP_NET_ADMIN — expect ERR_PERMISSION_DENIED'
+          ' (skipped if server has CAP_NET_ADMIN)')
+    with open_session(host, port, 'cap-attach-bitrate')[0] as s:
+        # Probe capability via VCAN_CREATE
+        s.sendall(make_iface_vcan_create('cap_probe99'))
+        probe = recv_frame(s)
+        if probe and probe[1] == MSG_IFACE_VCAN_ACK:
+            print('  [skip] server holds CAP_NET_ADMIN')
+            s.sendall(make_iface_vcan_destroy('cap_probe99'))
+            recv_frame(s)
+            return
+
+        # Server lacks CAP_NET_ADMIN — find any interface to test with
+        s.sendall(make_iface_list())
+        list_frame = recv_frame(s)
+        if list_frame is None or list_frame[1] != MSG_IFACE_LIST_RESP:
+            print('  [skip] could not list interfaces')
+            return
+        ifaces = parse_iface_list_resp(list_frame[2])
+        if not ifaces:
+            print('  [skip] no interfaces available')
+            return
+
+        iface_name, _ = ifaces[0]
+        s.sendall(make_iface_attach(iface_name, bitrate=500000))
+        frame = recv_frame(s)
+        print_response(frame)
+        if not check(frame is not None, 'received a response'):
+            return
+        _, msg_type, payload = frame
+        check(msg_type == MSG_ERR,
+              f'response is MSG_ERR (got {fmt_type(msg_type)})')
+        code, _ = decode_err(payload)
+        check(code == ERR_PERMISSION_DENIED,
+              f'err_code is ERR_PERMISSION_DENIED (got {fmt_err(code)})')
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 TESTS = [
@@ -1557,9 +1662,12 @@ TESTS = [
     test_own_lock_unlock,               # 34
     test_own_lock_not_held,             # 35
     test_own_session_close_releases,    # 36
+    test_cap_net_admin_vcan_create,     # 37
+    test_cap_net_admin_vcan_destroy,    # 38
+    test_cap_net_admin_attach_bitrate,  # 39
 ]
 
-AUTO_TESTS = TESTS[:7] + TESTS[9:16] + TESTS[17:]  # 1-7, 10-16, and 18-36 run unattended
+AUTO_TESTS = TESTS[:7] + TESTS[9:16] + TESTS[17:]  # 1-7, 10-16, and 18-39 run unattended
 
 
 def main():
