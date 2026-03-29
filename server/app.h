@@ -29,6 +29,13 @@
 void app_init(server_t *s);
 void app_destroy(void);
 
+/*
+ * Apply on_disconnect policies for all signals owned by session_id.
+ * Must be called before own_session_cleanup() so ownership records are
+ * still intact for the "all stopped" check.  (SPEC §11.3)
+ */
+void app_session_cleanup(uint32_t session_id);
+
 /* Called by iface.c when an interface is attached */
 void app_iface_attached(const char *iface_name, int can_fd, int app_listen_fd);
 

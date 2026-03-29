@@ -353,17 +353,38 @@ void own_session_cleanup(uint32_t session_id)
 {
     for (int i = 0; i < g_own_count; i++) {
         if (g_own[i].session_id == session_id) {
-            /*
-             * on_disconnect policy note: cyclic frame management (stop /
-             * last / default) will be enforced in the application-plane
-             * runtime (SPEC §10).  For now we simply release ownership so
-             * the signal becomes available for re-acquisition.
-             */
             g_own[i].session_id = 0;
             g_own[i].client_fd  = -1;
             g_own[i].locked     = 0;
         }
     }
+}
+
+void own_foreach_session_signal(uint32_t session_id, own_signal_cb_t cb,
+                                void *ctx)
+{
+    for (int i = 0; i < g_own_count; i++) {
+        if (g_own[i].session_id == session_id)
+            cb(g_own[i].sig_name, g_own[i].on_disconnect, ctx);
+    }
+}
+
+int own_frame_has_continuing_signal(const char *frame_name,
+                                    uint32_t skip_session_id)
+{
+    for (int i = 0; i < g_own_count; i++) {
+        if (g_own[i].session_id == 0 ||
+            g_own[i].session_id == skip_session_id)
+            continue;
+        if (g_own[i].on_disconnect == 0x01u) /* stop */
+            continue;
+        def_sig_info_t info;
+        if (def_resolve_signal(g_own[i].sig_name, &info) != 0)
+            continue;
+        if (strcmp(info.frame_name, frame_name) == 0)
+            return 1;
+    }
+    return 0;
 }
 
 /* -------------------------------------------------------------------------

@@ -785,6 +785,69 @@ static void app_handle_cyclic_timer(int timer_fd)
 }
 
 /* -------------------------------------------------------------------------
+ * app_session_cleanup  — apply on_disconnect policies (SPEC §11.3)
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+    uint32_t session_id;
+} app_disc_ctx_t;
+
+static void apply_signal_on_disconnect(const char *sig_name,
+                                        uint8_t on_disconnect, void *ctx_)
+{
+    app_disc_ctx_t *ctx = (app_disc_ctx_t *)ctx_;
+
+    if (on_disconnect == 0x02u) /* last: keep cycling unchanged */
+        return;
+
+    def_sig_info_t info;
+    if (def_resolve_signal(sig_name, &info) != 0)
+        return;
+    if (info.frame_tx_period == 0)
+        return; /* event-driven frame — no timer to manage */
+
+    uint8_t abs_start = (uint8_t)((int)info.pdu_byte_offset * 8
+                                  + (int)info.start_bit);
+
+    for (int i = 0; i < MAX_CYCLIC_FRAMES; i++) {
+        if (g_cyclic[i].can_sock_fd < 0)
+            continue;
+        if (strcmp(g_cyclic[i].frame_name, info.frame_name) != 0)
+            continue;
+
+        /* Zero this signal's bits in the data buffer */
+        if (info.byte_order == 0x01u)
+            pack_bits_le(g_cyclic[i].data, 0u, abs_start, info.bit_length);
+        else
+            pack_bits_be(g_cyclic[i].data, 0u, abs_start, info.bit_length);
+
+        if (on_disconnect == 0x03u) { /* default: physical = offset */
+            def_update_signal_value(sig_name, info.offset_val);
+        } else { /* stop */
+            /* Disarm timer only if no continuing signal remains in this frame */
+            if (!own_frame_has_continuing_signal(info.frame_name,
+                                                  ctx->session_id)) {
+                if (g_cyclic[i].timer_fd >= 0) {
+                    struct itimerspec its;
+                    memset(&its, 0, sizeof(its));
+                    timerfd_settime(g_cyclic[i].timer_fd, 0, &its, NULL);
+                    server_del_fd(g_server, g_cyclic[i].timer_fd);
+                    close(g_cyclic[i].timer_fd);
+                    g_cyclic[i].timer_fd = -1;
+                }
+                g_cyclic[i].can_sock_fd = -1;
+            }
+        }
+    }
+}
+
+void app_session_cleanup(uint32_t session_id)
+{
+    app_disc_ctx_t ctx = { session_id };
+    own_foreach_session_signal(session_id, apply_signal_on_disconnect, &ctx);
+}
+
+/* -------------------------------------------------------------------------
  * app_iface_attached / app_iface_detach
  * ---------------------------------------------------------------------- */
 
