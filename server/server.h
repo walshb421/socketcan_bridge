@@ -1,0 +1,37 @@
+#ifndef ASH_SERVER_H
+#define ASH_SERVER_H
+
+#include "ash/proto.h"
+#include <stdint.h>
+#include <sys/epoll.h>
+
+#define MAX_SESSIONS          1024
+#define DEFAULT_PORT          4000
+#define KEEPALIVE_TIMEOUT_SEC 30
+
+typedef struct {
+    int      fd;
+    int      timer_fd;
+    uint32_t session_id;                       /* 0 = not yet established */
+    char     client_name[PROTO_MAX_NAME + 1];
+} session_t;
+
+typedef struct {
+    int         epoll_fd;
+    int         listen_fd;
+    int         signal_fd;
+    int         netlink_fd;        /* RTMGRP_LINK monitoring socket (-1 if unused) */
+    const char *storage_dir;
+    uint16_t    port;
+    uint8_t     has_cap_net_admin; /* 1 if server holds CAP_NET_ADMIN */
+    session_t   sessions[MAX_SESSIONS];
+    int         nsessions;
+} server_t;
+
+int  server_init(server_t *s, uint16_t port, const char *storage_dir);
+void server_run(server_t *s);
+void server_destroy(server_t *s);
+int  server_add_fd(server_t *s, int fd, uint32_t events);
+int  server_del_fd(server_t *s, int fd);
+
+#endif /* ASH_SERVER_H */
