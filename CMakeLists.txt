@@ -22,6 +22,25 @@ add_library(libash_static STATIC lib/ash.c)
 set_target_properties(libash_shared PROPERTIES OUTPUT_NAME ash)
 set_target_properties(libash_static PROPERTIES OUTPUT_NAME ash)
 
-# Example client
-add_executable(ash-example examples/basic_client.c)
-target_link_libraries(ash-example libash_static)
+# Example clients — C
+add_executable(ash-example         examples/basic_client.c)
+add_executable(ash-example-monitor examples/signal_monitor.c)
+add_executable(ash-example-drive   examples/drive_sequence.c)
+add_executable(ash-example-loopback examples/vcan_loopback.c)
+
+target_link_libraries(ash-example          libash_static)
+target_link_libraries(ash-example-monitor  libash_static)
+target_link_libraries(ash-example-drive    libash_static)
+target_link_libraries(ash-example-loopback libash_static m)
+
+# Python client library (ctypes wrapper — no C compilation required)
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+    add_custom_target(ash-python
+        COMMAND ${Python3_EXECUTABLE} -m py_compile ${CMAKE_SOURCE_DIR}/lib/ash.py
+        COMMENT "Syntax-check Python client library (lib/ash.py)"
+        VERBATIM
+    )
+else()
+    message(WARNING "Python3 not found — ash-python target unavailable")
+endif()
