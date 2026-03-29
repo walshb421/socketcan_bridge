@@ -2,6 +2,7 @@
 #include "proto.h"
 #include "iface.h"
 #include "own.h"
+#include "app.h"
 
 #include "ash/proto.h"
 
@@ -72,6 +73,7 @@ void session_arm_timer(session_t *sess)
 void session_cleanup(server_t *s, session_t *sess)
 {
     if (sess->session_id != 0) {
+        app_session_cleanup(sess->session_id);
         own_session_cleanup(sess->session_id);
         iface_session_cleanup(s, sess->session_id);
     }
