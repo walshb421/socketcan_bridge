@@ -41,6 +41,7 @@ typedef struct {
     double   offset_val;
     double   min_val;
     double   max_val;
+    double   current_value;  /* cached last written/received value */
 } signal_def_t;
 
 typedef struct {
@@ -253,6 +254,7 @@ static int handle_def_signal(int fd, const proto_frame_t *frame)
 
     /* Insert or overwrite */
     signal_def_t *slot = signal_find(name);
+    int is_new = (slot == NULL);
     if (!slot) {
         if (g_signal_count >= MAX_SIGNALS) {
             proto_send_err(fd, ERR_DEF_INVALID, NULL);
@@ -269,6 +271,8 @@ static int handle_def_signal(int fd, const proto_frame_t *frame)
     slot->offset_val = offset_val;
     slot->min_val    = min_val;
     slot->max_val    = max_val;
+    if (is_new)
+        slot->current_value = 0.0;
 
     return proto_send_ack(fd, MSG_DEF_ACK, NULL, 0);
 }
@@ -824,6 +828,7 @@ void def_apply_entry(uint8_t entry_type, const uint8_t *payload, uint32_t len)
         (void)remaining;
 
         signal_def_t *slot = signal_find(name);
+        int slot_is_new = (slot == NULL);
         if (!slot) {
             if (g_signal_count >= MAX_SIGNALS) return;
             slot = &g_signals[g_signal_count++];
@@ -836,6 +841,8 @@ void def_apply_entry(uint8_t entry_type, const uint8_t *payload, uint32_t len)
         slot->offset_val = offset_val;
         slot->min_val    = min_val;
         slot->max_val    = max_val;
+        if (slot_is_new)
+            slot->current_value = 0.0;
 
     } else if (entry_type == DEF_TYPE_PDU) {
         if (remaining < 2u) return;
@@ -931,4 +938,187 @@ void def_apply_entry(uint8_t entry_type, const uint8_t *payload, uint32_t len)
         slot->pdu_count = pdu_count;
         memcpy(slot->pdus, mappings, pdu_count * sizeof(frame_pdu_mapping_t));
     }
+}
+
+/* -------------------------------------------------------------------------
+ * Application-plane helpers  (SPEC §5, §11)
+ * ---------------------------------------------------------------------- */
+
+/*
+ * def_resolve_signal — fill def_sig_info_t for a named signal.
+ *
+ * Traverses signal → PDU → frame to gather everything app.c needs for bit
+ * packing.  Returns:
+ *   0   fully resolved
+ *  -1   signal not found
+ *  -2   signal found but not mapped to any PDU/frame
+ */
+int def_resolve_signal(const char *sig_name, def_sig_info_t *out)
+{
+    signal_def_t *sig = signal_find(sig_name);
+    if (!sig)
+        return -1;
+
+    out->data_type  = sig->data_type;
+    out->byte_order = sig->byte_order;
+    out->bit_length = sig->bit_length;
+    out->scale      = sig->scale;
+    out->offset_val = sig->offset_val;
+    out->min_val    = sig->min_val;
+    out->max_val    = sig->max_val;
+
+    /* Walk every PDU to find a mapping for this signal */
+    for (int pi = 0; pi < g_pdu_count; pi++) {
+        const pdu_def_t *pu = &g_pdus[pi];
+        for (int si = 0; si < (int)pu->signal_count; si++) {
+            if (strcmp(pu->signals[si].sig_name, sig_name) != 0)
+                continue;
+
+            out->start_bit = pu->signals[si].start_bit;
+
+            /* Find the frame that contains this PDU */
+            for (int fi = 0; fi < g_frame_count; fi++) {
+                const frame_def_t *fr = &g_frames[fi];
+                for (int pp = 0; pp < (int)fr->pdu_count; pp++) {
+                    if (strcmp(fr->pdus[pp].pdu_name, pu->name) != 0)
+                        continue;
+
+                    out->pdu_byte_offset = fr->pdus[pp].byte_offset;
+                    memcpy(out->frame_name, fr->name, strlen(fr->name) + 1);
+                    out->frame_can_id   = fr->can_id;
+                    out->frame_id_type  = fr->id_type;
+                    out->frame_dlc      = fr->dlc;
+                    out->frame_tx_period = fr->tx_period;
+                    return 0;
+                }
+            }
+        }
+    }
+
+    return -2;
+}
+
+void def_update_signal_value(const char *sig_name, double value)
+{
+    signal_def_t *sig = signal_find(sig_name);
+    if (sig)
+        sig->current_value = value;
+}
+
+double def_get_signal_value(const char *sig_name)
+{
+    signal_def_t *sig = signal_find(sig_name);
+    return sig ? sig->current_value : 0.0;
+}
+
+/* -------------------------------------------------------------------------
+ * Bit extraction helpers for def_decode_frame_signals
+ * ---------------------------------------------------------------------- */
+
+static uint64_t extract_bits_le(const uint8_t *data, uint8_t start_bit,
+                                 uint8_t bit_length)
+{
+    uint64_t raw = 0;
+    for (int i = 0; i < (int)bit_length; i++) {
+        int bit_pos  = (int)start_bit + i;
+        int byte_idx = bit_pos / 8;
+        int bit_in   = bit_pos % 8;
+        if ((data[byte_idx] >> bit_in) & 1u)
+            raw |= (uint64_t)1u << i;
+    }
+    return raw;
+}
+
+static uint64_t extract_bits_be(const uint8_t *data, uint8_t start_bit,
+                                 uint8_t bit_length)
+{
+    uint64_t raw = 0;
+    int bit_pos = (int)start_bit;
+    for (int i = (int)bit_length - 1; i >= 0; i--) {
+        int byte_idx = bit_pos / 8;
+        int bit_in   = bit_pos % 8;
+        if ((data[byte_idx] >> bit_in) & 1u)
+            raw |= (uint64_t)1u << i;
+        if (bit_in == 0)
+            bit_pos += 15;
+        else
+            bit_pos--;
+    }
+    return raw;
+}
+
+int def_decode_frame_signals(uint32_t can_id, uint8_t id_type,
+                              const uint8_t *data, uint8_t data_len,
+                              def_decoded_sig_t *out, int max_out)
+{
+    /* Find the matching frame definition */
+    frame_def_t *fr = NULL;
+    for (int i = 0; i < g_frame_count; i++) {
+        if (g_frames[i].can_id == can_id && g_frames[i].id_type == id_type) {
+            fr = &g_frames[i];
+            break;
+        }
+    }
+    if (!fr)
+        return 0;
+
+    int count = 0;
+
+    for (int pi = 0; pi < (int)fr->pdu_count && count < max_out; pi++) {
+        uint8_t pdu_byte_offset = fr->pdus[pi].byte_offset;
+
+        pdu_def_t *pu = pdu_find(fr->pdus[pi].pdu_name);
+        if (!pu)
+            continue;
+
+        for (int si = 0; si < (int)pu->signal_count && count < max_out; si++) {
+            const char *sig_name = pu->signals[si].sig_name;
+            uint8_t     start_bit = pu->signals[si].start_bit;
+
+            signal_def_t *sig = signal_find(sig_name);
+            if (!sig)
+                continue;
+
+            /* Absolute start bit within the frame */
+            uint8_t abs_start = (uint8_t)((int)pdu_byte_offset * 8 + (int)start_bit);
+
+            /* Guard against out-of-bounds */
+            if ((int)abs_start + (int)sig->bit_length > (int)data_len * 8)
+                continue;
+
+            uint64_t raw;
+            if (sig->byte_order == 0x01u)
+                raw = extract_bits_le(data, abs_start, sig->bit_length);
+            else
+                raw = extract_bits_be(data, abs_start, sig->bit_length);
+
+            double phys;
+            if (sig->data_type == 0x03u) {
+                /* float: interpret raw as 32-bit IEEE 754 */
+                uint32_t raw32 = (uint32_t)(raw & 0xFFFFFFFFu);
+                float f;
+                memcpy(&f, &raw32, sizeof(f));
+                phys = (double)f;
+            } else if (sig->data_type == 0x02u) {
+                /* sint: sign-extend if MSB set */
+                int64_t sraw = (int64_t)raw;
+                if (sig->bit_length < 64u &&
+                    (raw >> (sig->bit_length - 1u)) & 1u) {
+                    sraw = (int64_t)(raw | (~((uint64_t)0) << sig->bit_length));
+                }
+                phys = (double)sraw * sig->scale + sig->offset_val;
+            } else {
+                /* uint */
+                phys = (double)raw * sig->scale + sig->offset_val;
+            }
+
+            sig->current_value = phys;
+
+            memcpy(out[count].sig_name, sig_name, strlen(sig_name) + 1);
+            out[count].value = phys;
+            count++;
+        }
+    }
+
+    return count;
 }

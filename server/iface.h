@@ -46,4 +46,15 @@ void iface_handle_netlink(void);
  */
 void iface_session_cleanup(server_t *s, uint32_t session_id);
 
+/*
+ * Return the session_id that has attached the named interface,
+ * or 0 if no session owns it.
+ */
+uint32_t iface_get_session_id(const char *iface_name);
+
+/*
+ * Return the SocketCAN fd for the named interface, or -1 if not attached.
+ */
+int iface_get_can_fd(const char *iface_name);
+
 #endif /* ASH_SERVER_IFACE_H */

@@ -5,6 +5,7 @@
 #include "def.h"
 #include "own.h"
 #include "cfg.h"
+#include "app.h"
 
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
@@ -238,6 +239,9 @@ int server_init(server_t *s, uint16_t port, const char *storage_dir)
     cfg_register_handlers();
     cfg_autoload();
 
+    /* --- Application plane runtime --- */
+    app_init(s);
+
     printf("ash-server listening on port %u\n", (unsigned)port);
     return 0;
 }
@@ -290,6 +294,10 @@ void server_run(server_t *s)
                 iface_handle_netlink();
 
             } else {
+                /* Give the app plane first chance to handle this fd */
+                if (app_handle_event(fd, events[i].events))
+                    continue;
+
                 /* Check if this fd is a keep-alive timerfd */
                 session_t *tsess = session_find_by_timer_fd(s, fd);
                 if (tsess) {
@@ -400,6 +408,7 @@ void server_destroy(server_t *s)
         s->sessions[i].fd = -1;
     }
 
+    app_destroy();
     own_destroy();
     def_destroy();
     iface_destroy();
