@@ -13,6 +13,7 @@ include_directories(include)
 # Server
 add_executable(ash-server server/main.c server/server.c server/proto.c server/session.c server/iface.c server/def.c server/own.c server/cfg.c server/app.c)
 target_compile_definitions(ash-server PRIVATE _GNU_SOURCE)
+target_link_libraries(ash-server m)
 
 # Client library
 add_library(libash_shared SHARED lib/ash.c)
@@ -20,3 +21,7 @@ add_library(libash_static STATIC lib/ash.c)
 
 set_target_properties(libash_shared PROPERTIES OUTPUT_NAME ash)
 set_target_properties(libash_static PROPERTIES OUTPUT_NAME ash)
+
+# Example client
+add_executable(ash-example examples/basic_client.c)
+target_link_libraries(ash-example libash_static)
