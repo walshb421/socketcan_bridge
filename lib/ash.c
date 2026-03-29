@@ -121,23 +121,28 @@ static double decode_be_double(const uint8_t *p)
 static int cfg_send(int fd, uint16_t msg_type,
                     const void *payload, uint32_t plen)
 {
-    uint8_t hdr[PROTO_HEADER_SIZE];
+    /*
+     * Combine header and payload into a single write so they land in one
+     * TCP segment.  The server uses non-blocking accepted sockets and its
+     * proto_read_exact does not handle EAGAIN, so splitting into two writes
+     * risks a race where the header arrives but the payload has not yet
+     * when the server's EPOLLIN fires.
+     */
+    uint8_t  buf[PROTO_HEADER_SIZE + PROTO_MAX_PAYLOAD];
 
-    hdr[0] = (uint8_t)((PROTO_VERSION >> 8) & 0xFF);
-    hdr[1] = (uint8_t)( PROTO_VERSION       & 0xFF);
-    hdr[2] = (uint8_t)((msg_type >> 8) & 0xFF);
-    hdr[3] = (uint8_t)( msg_type       & 0xFF);
-    hdr[4] = (uint8_t)((plen >> 24) & 0xFF);
-    hdr[5] = (uint8_t)((plen >> 16) & 0xFF);
-    hdr[6] = (uint8_t)((plen >>  8) & 0xFF);
-    hdr[7] = (uint8_t)( plen        & 0xFF);
+    buf[0] = (uint8_t)((PROTO_VERSION >> 8) & 0xFF);
+    buf[1] = (uint8_t)( PROTO_VERSION       & 0xFF);
+    buf[2] = (uint8_t)((msg_type >> 8) & 0xFF);
+    buf[3] = (uint8_t)( msg_type       & 0xFF);
+    buf[4] = (uint8_t)((plen >> 24) & 0xFF);
+    buf[5] = (uint8_t)((plen >> 16) & 0xFF);
+    buf[6] = (uint8_t)((plen >>  8) & 0xFF);
+    buf[7] = (uint8_t)( plen        & 0xFF);
 
-    if (write_exact(fd, hdr, PROTO_HEADER_SIZE) < 0)
-        return -1;
     if (plen > 0 && payload)
-        if (write_exact(fd, payload, plen) < 0)
-            return -1;
-    return 0;
+        memcpy(buf + PROTO_HEADER_SIZE, payload, plen);
+
+    return write_exact(fd, buf, PROTO_HEADER_SIZE + plen);
 }
 
 /* -------------------------------------------------------------------------
@@ -240,18 +245,18 @@ static int cfg_request(ash_ctx_t *ctx,
 static int app_send(int fd, uint16_t msg_type,
                     const void *payload, uint16_t plen)
 {
-    uint8_t hdr[APP_HDR_SIZE];
-    hdr[0] = (uint8_t)((msg_type >> 8) & 0xFF);
-    hdr[1] = (uint8_t)( msg_type       & 0xFF);
-    hdr[2] = (uint8_t)((plen >> 8) & 0xFF);
-    hdr[3] = (uint8_t)( plen       & 0xFF);
+    /* Same single-write strategy as cfg_send — server app sockets are
+     * also non-blocking and app_handle_client does not handle EAGAIN. */
+    uint8_t buf[APP_HDR_SIZE + APP_MAX_PAYLOAD];
+    buf[0] = (uint8_t)((msg_type >> 8) & 0xFF);
+    buf[1] = (uint8_t)( msg_type       & 0xFF);
+    buf[2] = (uint8_t)((plen >> 8) & 0xFF);
+    buf[3] = (uint8_t)( plen       & 0xFF);
 
-    if (write_exact(fd, hdr, APP_HDR_SIZE) < 0)
-        return -1;
     if (plen > 0 && payload)
-        if (write_exact(fd, payload, plen) < 0)
-            return -1;
-    return 0;
+        memcpy(buf + APP_HDR_SIZE, payload, plen);
+
+    return write_exact(fd, buf, APP_HDR_SIZE + plen);
 }
 
 /* -------------------------------------------------------------------------

@@ -634,6 +634,21 @@ static int handle_iface_attach(int fd, const proto_frame_t *frame)
         fprintf(stderr, "ash-server: bitrate config failed for %s (continuing)\n",
                 name);
 
+    /*
+     * iface_set_bitrate brings the interface DOWN then UP via netlink, which
+     * generates RTM_NEWLINK events on g_netlink_fd.  If those events are left
+     * in the socket's receive buffer, the epoll loop will call
+     * iface_handle_netlink after this handler returns, see "interface went
+     * down", and immediately call iface_entry_detach — destroying the
+     * attachment we are about to create.  Drain them here to prevent that.
+     */
+    if (bitrate != 0 && g_netlink_fd >= 0) {
+        char drain_buf[8192];
+        while (recv(g_netlink_fd, drain_buf, sizeof(drain_buf),
+                    MSG_DONTWAIT) > 0)
+            ;
+    }
+
     /* Open SocketCAN socket */
     int can_sock = socket(AF_CAN, SOCK_RAW, CAN_RAW);
     if (can_sock < 0) {

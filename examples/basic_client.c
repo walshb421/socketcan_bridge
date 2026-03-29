@@ -25,6 +25,16 @@ int main(void)
         /* vcan0 may already exist — ignore error */
     }
 
+    /*
+     * Clean up any leftover definitions from a prior run.
+     * Definitions persist across sessions, so delete frame → PDU → signal
+     * before re-defining them.  Errors here are expected (nothing to delete
+     * on the first run) so they are silently ignored.
+     */
+    ash_delete_def(ctx, "EngineFrame", ASH_DEF_FRAME);
+    ash_delete_def(ctx, "EnginePDU",   ASH_DEF_PDU);
+    ash_delete_def(ctx, "EngineRPM",   ASH_DEF_SIGNAL);
+
     /* Define a signal */
     ash_signal_def_t sig = {
         .name       = "EngineRPM",
@@ -81,8 +91,10 @@ int main(void)
     }
     printf("Frame 'EngineFrame' defined\n");
 
-    /* Attach to the virtual CAN interface */
-    if (ash_iface_attach(ctx, "vcan0", ASH_MODE_CAN20B, 500000) < 0) {
+    /* Attach to the virtual CAN interface.
+     * Use bitrate=0 for vcan: the interface has no real hardware to configure
+     * and requesting bitrate 0 skips iface_set_bitrate on the server. */
+    if (ash_iface_attach(ctx, "vcan0", ASH_MODE_CAN20B, 0) < 0) {
         fprintf(stderr, "ash_iface_attach failed\n");
         ash_disconnect(ctx);
         return 1;
