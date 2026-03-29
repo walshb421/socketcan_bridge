@@ -1719,12 +1719,14 @@ def test_cfg_load_bad_checksum(host, port):
         print('  [skip] --storage-dir not provided')
         return
 
-    # Write a file with valid header fields but CRC = 0x00000000 (wrong)
+    # Write a file with valid header fields but a wrong CRC.
+    # Note: CRC32 of an empty body is 0x00000000 (0xFFFFFFFF ^ 0xFFFFFFFF),
+    # so 0x00000000 would actually pass validation.  Use 0xDEADBEEF instead.
     path = os.path.join(_storage_dir, 't43_badcrc.ashcfg')
     magic   = 0x41534843
     version = 0x0001
     count   = 0
-    bad_crc = 0x00000000   # intentionally wrong (correct CRC for empty body ≠ 0)
+    bad_crc = 0xDEADBEEF   # intentionally wrong (correct CRC for empty body = 0x00000000)
     # '>IHHI': magic(uint32) + version(uint16) + count(uint16) + crc(uint32)
     header = struct.pack('>I', magic) + struct.pack('>H', version) + \
              struct.pack('>H', count) + struct.pack('>I', bad_crc)
