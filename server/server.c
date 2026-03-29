@@ -4,6 +4,7 @@
 #include "iface.h"
 #include "def.h"
 #include "own.h"
+#include "cfg.h"
 
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
@@ -231,6 +232,11 @@ int server_init(server_t *s, uint16_t port, const char *storage_dir)
     /* --- Ownership module --- */
     own_init(s);
     own_register_handlers();
+
+    /* --- Configuration persistence --- */
+    cfg_init(s->storage_dir);
+    cfg_register_handlers();
+    cfg_autoload();
 
     printf("ash-server listening on port %u\n", (unsigned)port);
     return 0;
