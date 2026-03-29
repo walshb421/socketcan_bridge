@@ -389,3 +389,9 @@ void own_register_handlers(void)
     proto_register_handler(MSG_OWN_LOCK,    handle_own_lock);
     proto_register_handler(MSG_OWN_UNLOCK,  handle_own_unlock);
 }
+
+int own_session_owns_signal(uint32_t session_id, const char *sig_name)
+{
+    own_entry_t *e = own_find(sig_name);
+    return (e && e->session_id == session_id) ? 1 : 0;
+}

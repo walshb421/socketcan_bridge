@@ -12,6 +12,7 @@
  * ========================================================================= */
 
 #include "iface.h"
+#include "app.h"
 #include "proto.h"
 #include "session.h"
 #include "ash/proto.h"
@@ -247,6 +248,10 @@ static iface_entry_t *iface_table_get_or_add(const char *name)
 
 static void iface_entry_detach(iface_entry_t *e)
 {
+    /* Notify app module before closing fds */
+    if (e->can_fd >= 0 || e->app_listen_fd >= 0)
+        app_iface_detach(e->name, e->can_fd, e->app_listen_fd);
+
     if (e->can_fd >= 0) {
         close(e->can_fd);
         e->can_fd = -1;
@@ -258,6 +263,18 @@ static void iface_entry_detach(iface_entry_t *e)
     e->session_id = 0;
     e->client_fd  = -1;
     e->app_port   = 0;
+}
+
+uint32_t iface_get_session_id(const char *iface_name)
+{
+    iface_entry_t *e = iface_table_find(iface_name);
+    return e ? e->session_id : 0;
+}
+
+int iface_get_can_fd(const char *iface_name)
+{
+    iface_entry_t *e = iface_table_find(iface_name);
+    return e ? e->can_fd : -1;
 }
 
 /* -------------------------------------------------------------------------
@@ -690,6 +707,9 @@ static int handle_iface_attach(int fd, const proto_frame_t *frame)
 
     printf("ash-server: session %u attached to %s (mode=0x%02x, app port=%u)\n",
            sess->session_id, name, mode, app_port);
+
+    /* Notify app module that a new interface is active */
+    app_iface_attached(name, can_sock, app_fd);
 
     /* IFACE_ATTACH_ACK: 2-byte big-endian port */
     uint8_t ack[2];
